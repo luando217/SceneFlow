@@ -8,20 +8,20 @@
 
 ## Summary
 
-| Item | Status |
-|------|--------|
-| GRILL Q1-Q20 | ALL LOCKED |
-| DATA_ARCHITECTURE.md | PATCHED (packages/frames → source/frames) |
-| APP1_ARCHITECTURE.md | PATCHED (packages/frames → source/frames) |
-| PROMPT_ARCHITECTURE.md | PATCHED (frames path + remove grouping_candidates) |
-| GRILL_LOCK.md | UPDATED |
-| APP2_ARCHITECTURE.md | PENDING |
+| Item | Status | Path |
+|------|--------|------|
+| GRILL Q1-Q20 | ALL LOCKED | `docs/locks/GRILL_LOCK.md` |
+| DATA_ARCHITECTURE.md | PATCHED (packages/frames → source/frames) | `docs/architecture/DATA_ARCHITECTURE.md` |
+| APP1_ARCHITECTURE.md | PATCHED (packages/frames → source/frames) | `docs/architecture/APP1_ARCHITECTURE.md` |
+| PROMPT_ARCHITECTURE.md | PATCHED (frames path + remove grouping_candidates) | `docs/architecture/PROMPT_ARCHITECTURE.md` |
+| GRILL_LOCK.md | UPDATED | `docs/locks/GRILL_LOCK.md` |
+| APP2_ARCHITECTURE.md | PENDING | — |
 
 ---
 
 ## Patches Applied
 
-### 1. DATA_ARCHITECTURE.md — packages/frames → source/frames
+### 1. `DATA_ARCHITECTURE.md` — packages/frames → source/frames
 
 **Reason:** GRILL 4, GRILL 11 — Contradiction resolved
 **Files Changed:**
@@ -31,14 +31,14 @@
 4. IMMUTABLE FIELD SUMMARY: `frames/scene_src_XXXX.png` → `source/frames/scene_src_XXXX.png`
 5. DATA CONTRACT SUMMARY TABLE: `frames/scene_src_XXXX.png` → `source/frames/scene_src_XXXX.png`
 
-### 2. APP1_ARCHITECTURE.md — packages/frames → source/frames
+### 2. `APP1_ARCHITECTURE.md` — packages/frames → source/frames
 
 **Reason:** GRILL 4, GRILL 11 — Contradiction resolved
 **Changes:**
 1. Output structure: removed `packages/frames/` from tree
 2. Frame Location note: `packages/frames/` → `source/frames/`
 
-### 3. PROMPT_ARCHITECTURE.md — Multiple fixes
+### 3. `PROMPT_ARCHITECTURE.md` — Multiple fixes
 
 **Reason:** GRILL 11 (frames path), GRILL 15 (remove grouping_candidates)
 **Changes:**

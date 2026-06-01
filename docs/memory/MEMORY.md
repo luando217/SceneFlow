@@ -3,7 +3,7 @@
 Current Phase:
 APP2_ARCHITECTURE
 
-Locked:
+Locked (see `docs/architecture/` and `docs/locks/`):
 
 * PROJECT_VISION
 * DATA_ARCHITECTURE
