@@ -1,43 +1,16 @@
 # DOCS REFACTOR REPORT
 
-**Date:** 2026-06-01
+**Date:** 2026-06-01  
+**Phase:** RB3.MERGE — Documentation Restructure
 
 ## Summary
 
-Reorganized the flat `.md` file structure into a hierarchical `docs/` layout for maintainability.
+Restructured the root-level documentation into a categorized `docs/` directory hierarchy.
 
-## New Structure
+### Files Moved
 
-```
-docs/
-├── architecture/       # Architecture documents (locked)
-│   ├── PROJECT_VISION.md
-│   ├── DATA_ARCHITECTURE.md
-│   ├── SYSTEM_ARCHITECTURE.md
-│   ├── EXECUTION_WORKFLOW.md
-│   ├── PROMPT_ARCHITECTURE.md
-│   ├── APP1_ARCHITECTURE.md
-│   ├── GROUPING_ARCHITECTURE.md
-│   ├── RECONSTRUCTION_ARCHITECTURE.md
-│   └── RB3_ARCHITECTURE_MASTER.md
-├── audit/              # Audit reports
-│   ├── CONSISTENCY_AUDIT.md
-│   ├── ARCHITECTURE_RECOVERY_AUDIT.md
-│   └── trace_subtitle_loading.md
-├── locks/              # Locked decision records
-│   └── GRILL_LOCK.md
-├── memory/             # Project memory & context
-│   ├── MEMORY.md
-│   ├── PROJECT_CONTEXT.md
-│   └── task_progress.md
-└── rules/              # Rules & policies
-    └── SKILL_RULE_BUG_CORE.md
-```
-
-## Files Moved
-
-| Original Path | New Path |
-|---|---|
+| Source | Target |
+|--------|--------|
 | `PROJECT_VISION.md` | `docs/architecture/PROJECT_VISION.md` |
 | `DATA_ARCHITECTURE.md` | `docs/architecture/DATA_ARCHITECTURE.md` |
 | `SYSTEM_ARCHITECTURE.md` | `docs/architecture/SYSTEM_ARCHITECTURE.md` |
@@ -47,34 +20,61 @@ docs/
 | `GROUPING_ARCHITECTURE.md` | `docs/architecture/GROUPING_ARCHITECTURE.md` |
 | `RECONSTRUCTION_ARCHITECTURE.md` | `docs/architecture/RECONSTRUCTION_ARCHITECTURE.md` |
 | `RB3_ARCHITECTURE_MASTER.md` | `docs/architecture/RB3_ARCHITECTURE_MASTER.md` |
-| `GRILL_LOCK.md` | `docs/locks/GRILL_LOCK.md` |
 | `CONSISTENCY_AUDIT.md` | `docs/audit/CONSISTENCY_AUDIT.md` |
 | `ARCHITECTURE_RECOVERY_AUDIT.md` | `docs/audit/ARCHITECTURE_RECOVERY_AUDIT.md` |
-| `PROJECT_CONTEXT.md` | `docs/memory/PROJECT_CONTEXT.md` |
-| `task_progress.md` | `docs/memory/task_progress.md` |
-| `SKILL_RULE_BUG_CORE.md` | `docs/rules/SKILL_RULE_BUG_CORE.md` |
+| `GRILL_LOCK.md` | `docs/locks/GRILL_LOCK.md` |
+| `skills-lock.json` | `docs/locks/skills-lock.json` |
 | `docs/MEMORY.md` | `docs/memory/MEMORY.md` |
-| `docs/trace_subtitle_loading.md` | `docs/audit/trace_subtitle_loading.md` |
+| `PROJECT_CONTEXT.md` | `docs/memory/PROJECT_CONTEXT.md` |
+| `SKILL_RULE_BUG_CORE.md` | `docs/rules/SKILL_RULE_BUG_CORE.md` |
 
-## Files Updated
+### Files Staying at Root (intentional)
 
-| File | Change |
-|---|---|
-| `README.md` | Added `## Documentation Structure` section with tree |
-| `docs/memory/MEMORY.md` | Updated locked section to note `docs/architecture/` and `docs/locks/` |
-| `docs/audit/CONSISTENCY_AUDIT.md` | Added Path column to summary table |
+- `README.md` — project readme
+- `SceneFlow.py` — main entry point
+- `package_loader.py` — source code
+- `package_loader.py.v3_cleanup_backup` — backup
+- `scene_analyzer_config.json` — config
+- `task_progress.md` — operational log
+- `.gitignore` — git config
+- `skills-lock.json` — moved to `docs/locks/`
 
-## No-Change Notes
+### Updated References
 
-- All internal cross-references between .md files use plain text labels, not markdown hrefs — no link rewrites needed
-- `.clinerules/default-rules.md` embeds `PROJECT_CONTEXT.md` content inline — no path update needed
+- **MEMORY.md** — updated locked doc references with new paths
+- **README.md** — added Documentation section with path table
 
-## Verification
+### Final Tree Structure
 
-- README.md remains at root as project entry point
-- Only `.md` files moved; no code/config files affected
-- All 17 documentation files accounted for in new structure
+```
+docs/
+├── architecture/
+│   ├── APP1_ARCHITECTURE.md
+│   ├── DATA_ARCHITECTURE.md
+│   ├── EXECUTION_WORKFLOW.md
+│   ├── GROUPING_ARCHITECTURE.md
+│   ├── PROJECT_VISION.md
+│   ├── PROMPT_ARCHITECTURE.md
+│   ├── RB3_ARCHITECTURE_MASTER.md
+│   ├── RECONSTRUCTION_ARCHITECTURE.md
+│   └── SYSTEM_ARCHITECTURE.md
+├── audit/
+│   ├── ARCHITECTURE_RECOVERY_AUDIT.md
+│   └── CONSISTENCY_AUDIT.md
+├── locks/
+│   ├── GRILL_LOCK.md
+│   └── skills-lock.json
+├── memory/
+│   ├── MEMORY.md
+│   └── PROJECT_CONTEXT.md
+├── rules/
+│   └── SKILL_RULE_BUG_CORE.md
+└── trace_subtitle_loading.md
+```
 
----
+### Verification
 
-**END OF DOCS_REFACTOR_REPORT.md**
+- Zero internal markdown links existed in any moved files (verified via grep)
+- No cross-references to update between files
+- All files present at new locations
+- No orphaned `.md`/`.json` files at root
