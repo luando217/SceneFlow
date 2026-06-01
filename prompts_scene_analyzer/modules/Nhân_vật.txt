@@ -1,0 +1,20 @@
+# Nhânvật
+# Add your prompt content here
+* Minato = nam tóc nâu
+* Sơn Thần = sói trắng lớn, lông trắng, lông màu vàng, có vạch đỏ
+* Phong Thần = thần nhật bản nhỏ có sừng và da xanh dương, không có cảnh, tóc trắng, quần áo đỏ, đằng sau có cái bao trắng. tóc xanh trắng và đôi mắt xanh ruby
+* Lôi Thần = thần nhật bản nhỏ có sừng và da đỏ, màu đỏ đậm , không có cảnh, tóc trắng, quần áo đỏ, đằn sau có 5 vòng tròn màu vàn có hoa văn đen xoáy hình 3 giọt nước, tóc vàng trắng và đôi mắt vàng 
+* Rồng Thần = rồng màu xanh, có cánh, màu xanh, có đuôi, sừng màu vàng, cánh màu pha xanh xuống vàng, có 4 tay chân kiểu thằn lằn có cánh
+* Saiga = tóc đen đeo kính
+* Kỳ Lân = kỳ lân màu vàng xanh
+* Rùa Thần = rùa vàng, có cây ở trên mai
+* Usuji = chồn đuôi xanh, mặt trắng, lông trắng, hơi giống mèo
+* Torika = chồn đuôi vàng, mặt trắng, lông trắng, hơi giống mèo
+* Seri = chồn đuôi đỏ, mặt trắng, lông trắng, hơi giống mèo
+* Thiên Hồ = cáo chín đuôi
+* Phượng Hoàng = chim lửa
+
+* Bối cảnh nhân vật minato chuyên nhà về quê, căn nhà gỗ nhật có sân vườn, ao, khá rộng phần lớn hoạt động diễn ra ở đây
+* Khu rừng sau núi, rộng lớn nhiều cây cối dày đặc
+* Cổng nhà, nhìn ra ruộng lúa hoặc đường làng
+* Cách phân cảnh nhà cao tầng, nhà không có minato và các thần thú thường là khu vực khác

@@ -1,0 +1,3789 @@
+"""
+Scene Package Loader
+Load exported runtime packages from App 1 for semantic analysis.
+
+Architecture:
+- NO raw video loading
+- NO cv2.VideoCapture
+- NO ffmpeg/ffplay
+- Loads ONLY runtime packages exported by SceneFlow.py:
+  packages/       - scene packages
+  frames/         - pre-exported PNG frames
+  runtime_timeline.json - ACTIVE FILTERED RUNTIME DATABASE entries
+  runtime_manifest.json - package metadata
+  runtime_subtitles.json - ACTIVE FILTERED subtitle database (PRIMARY)
+  runtime_audio_regions.json - ACTIVE FILTERED audio regions (PRIMARY)
+
+LOAD ORDER:
+  subtitles: runtime_subtitles.json -> source_subtitles.json (fallback)
+  audio: runtime_audio_regions.json -> source_audio_regions.json (fallback)
+
+This module is the semantic analysis relay and AI communication layer.
+It is NOT:
+- video editor
+- renderer
+- runtime generator
+- grouping engine
+
+SceneFlow.py owns:
+- immutable runtime package generator
+- source reconstruction exporter
+- timeline exporter
+
+package_loader.py owns:
+- semantic analysis relay
+- AI communication layer
+- semantic metadata exporter
+"""
+
+import sys
+import os
+import json
+import shutil
+import subprocess
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+import re
+
+# Qt/PySide6 imports
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QListWidget, QLabel, QPushButton, QTextEdit,
+    QTabWidget, QFileDialog, QMessageBox, QCheckBox, QGroupBox,
+    QScrollArea, QFrame, QProgressBar, QComboBox, QSpinBox, QTableWidget,
+    QTableWidgetItem, QInputDialog
+)
+from PySide6.QtWidgets import QListWidgetItem as QtWidgets_QListWidgetItem
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QProcess
+from PySide6.QtWidgets import QAbstractItemView
+from PySide6.QtGui import QPixmap, QTextCursor, QColor
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# NO global analysis OUTPUT_BASE or ANALYSIS_CURRENT_DIR
+# All analysis is package-local: output/<video_name>/analysis/
+PROMPTS_DIR = "prompts_scene_analyzer"
+CONFIG_FILE = "scene_analyzer_config.json"
+PROFILE_FILE = "prompts_scene_analyzer/active_profile.json"
+PROFILES_DIR = "prompts_scene_analyzer/profiles/"
+UI_LAYOUT_FILE = "config/ui_layout.json"
+
+# Default AI settings
+DEFAULT_PROVIDER = "ollama"
+DEFAULT_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_MODEL = "llava:7b"
+
+# Batch timeout settings (ms)
+SINGLE_BATCH_TIMEOUT_MS = 180000   # 3 minutes for single-scene
+MULTI_BATCH_TIMEOUT_MS = 600000    # 10 minutes for multi-scene batch
+
+# SceneFlow.py immutable source naming prefix
+SCENE_SRC_PREFIX = "scene_src_"
+
+# ============================================================================
+# PROMPT TEMPLATES
+# ============================================================================
+
+DEFAULT_PROMPTS = {
+    "Known Characters": """Known characters:
+
+(character definitions go here)
+""",
+
+    "Scene Analysis Prompt": """# Scene Analysis Prompt
+
+Analyze this anime scene frame and extract structured information.
+
+Focus on:
+- What is happening in this scene
+- Who are the characters present
+- What actions occur
+- What is the environment/setting
+- Any visible text or dialogue context
+
+Extract factual, structured observations. Avoid poetic descriptions.
+
+""",
+
+    "Context Memory Prompt": """You are analyzing a sequence of scenes with previous context.
+
+PREVIOUS_CONTEXT contains analysis from recently analyzed scenes.
+This context helps you maintain:
+- Character continuity across scenes
+- Location continuity
+- Action progression
+- Narrative consistency
+
+IMPORTANT RULES for using PREVIOUS_CONTEXT:
+1. Previous context is REFERENCE ONLY - do not repeat previous descriptions
+2. Every image must be analyzed independently and described anew
+3. Do NOT write "same as previous" or "continues from previous"
+4. Do NOT write "similar to" or "like the previous scene"
+5. Do NOT copy character/location descriptions from PREVIOUS_CONTEXT
+6. Build upon continuity hints to describe NEW developments only
+
+Use PREVIOUS_CONTEXT to:
+- Track which characters reappear
+- Detect location changes vs same location
+- Identify action progression/evolution
+- Maintain narrative consistency
+
+But always provide FRESH descriptions for each scene's unique content.
+""",
+
+    "AI Contract": """You are analyzing anime scenes. Output structured data.
+
+<<OUTPUT_BLOCK>>
+scene_id=
+scene_file=
+scene_start=
+scene_end=
+scene_duration=
+
+scene_summary=
+shot_type=
+characters=
+creatures=
+actions=
+environment=
+objects=
+visibility=
+confidence=
+
+story_context=
+ongoing_events=
+relationships=
+
+ocr_text=
+dialogue_notes=
+
+supplemental_notes=
+<</OUTPUT_BLOCK>>"""
+}
+
+# ============================================================================
+# PROFILE STORAGE
+# ============================================================================
+
+DEFAULT_PROFILE = {
+    "version": 1,
+    "modules": {}
+}
+
+
+def _load_profile() -> dict:
+    """Load active profile from active_profile.json.
+    
+    Returns dict with 'modules' key containing {module_name: {"filename": str, "enabled": bool, "priority": int}}.
+    Missing file returns empty profile.
+    """
+    profile_path = Path(PROFILE_FILE)
+    if not profile_path.exists():
+        return DEFAULT_PROFILE.copy()
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return DEFAULT_PROFILE.copy()
+            if "modules" not in data:
+                data["modules"] = {}
+            return data
+    except (json.JSONDecodeError, Exception):
+        return DEFAULT_PROFILE.copy()
+
+
+def _save_profile(profile: dict) -> None:
+    """Save active profile to active_profile.json."""
+    profile_path = Path(PROFILE_FILE)
+    ensure_dir(str(profile_path.parent))
+    profile["version"] = 1
+    try:
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save profile: {e}")
+
+
+def _load_profile_list() -> List[str]:
+    """Load list of available profile names from prompts_scene_analyzer/profiles/.
+    
+    Returns list of profile names (without .json extension).
+    Always includes 'Default' profile if no profiles exist.
+    """
+    profiles_dir = Path(PROFILES_DIR)
+    ensure_dir(str(profiles_dir))
+    
+    profiles = []
+    for f in profiles_dir.glob("*.json"):
+        name = f.stem
+        if name != "Default":  # Default is virtual
+            profiles.append(name)
+    
+    profiles.sort()
+    return profiles
+
+
+def _load_named_profile(profile_name: str) -> dict:
+    """Load a named profile from prompts_scene_analyzer/profiles/<name>.json.
+    
+    Returns profile dict with 'modules' key, or DEFAULT_PROFILE if not found.
+    """
+    if profile_name == "Default":
+        return DEFAULT_PROFILE.copy()
+    
+    profile_path = Path(PROFILES_DIR) / f"{profile_name}.json"
+    if not profile_path.exists():
+        return DEFAULT_PROFILE.copy()
+    
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return DEFAULT_PROFILE.copy()
+            if "modules" not in data:
+                data["modules"] = {}
+            return data
+    except (json.JSONDecodeError, Exception):
+        return DEFAULT_PROFILE.copy()
+
+
+def _save_named_profile(profile_name: str, profile: dict) -> None:
+    """Save a named profile to prompts_scene_analyzer/profiles/<name>.json."""
+    if profile_name == "Default":
+        return  # Cannot save to Default profile
+    
+    profile_path = Path(PROFILES_DIR) / f"{profile_name}.json"
+    ensure_dir(str(profile_path.parent))
+    profile["version"] = 1
+    
+    try:
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save profile '{profile_name}': {e}")
+
+
+def _delete_named_profile(profile_name: str) -> bool:
+    """Delete a named profile file from prompts_scene_analyzer/profiles/.
+    
+    Returns True if deleted, False if not found or protected.
+    Cannot delete 'Default' profile.
+    """
+    if profile_name == "Default":
+        return False
+    
+    profile_path = Path(PROFILES_DIR) / f"{profile_name}.json"
+    if not profile_path.exists():
+        return False
+    
+    try:
+        profile_path.unlink()
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+
+def ensure_dir(path: str) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def clear_directory(dir_path: str) -> None:
+    """Delete and recreate a directory to ensure it's empty."""
+    path = Path(dir_path)
+    if path.exists():
+        shutil.rmtree(str(path))
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def get_analysis_dir(package_dir: str) -> Path:
+    """Get package-local analysis directory: output/<video_name>/analysis/"""
+    pkg = Path(package_dir)
+    return pkg / "analysis"
+
+
+def parse_subtitle_srt(srt_text: str) -> List[Dict]:
+    """Parse SRT format subtitles into structured list with start/end times.
+
+    SRT format:
+    1
+    00:00:01,000 --> 00:00:04,000
+    Subtitle text line 1
+    Subtitle text line 2
+
+    Output: list of {"start": float, "end": float, "text": str}
+    """
+    if not srt_text:
+        return []
+    parsed = []
+    # Split into blocks
+    blocks = re.split(r'\n\n+', srt_text.strip())
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 2:
+            continue
+        # Find timing line (contains -->)
+        timing_line = None
+        text_lines = []
+        for i, line in enumerate(lines):
+            if '-->' in line:
+                timing_line = line
+                text_lines = lines[i+1:]
+                break
+        if not timing_line:
+            continue
+        # Parse timing
+        try:
+            parts = timing_line.split('-->')
+            start_str = parts[0].strip()
+            end_str = parts[1].strip().split()[0]  # Handle any extra text after end time
+            start = parse_srt_time(start_str)
+            end = parse_srt_time(end_str)
+            text = ' '.join(text_lines).strip()
+            if text:
+                parsed.append({"start": start, "end": end, "text": text})
+        except Exception:
+            continue
+    return parsed
+
+
+def parse_srt_time(time_str: str) -> float:
+    """Parse SRT time string (HH:MM:SS,mmm) to float seconds."""
+    # Remove commas and split
+    time_str = time_str.replace(',', '.').strip()
+    parts = time_str.split(':')
+    if len(parts) == 3:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+        return hours * 3600 + minutes * 60 + seconds
+    return 0.0
+
+
+def parse_subtitle_json(subtitles_data: List[Dict]) -> List[Dict]:
+    """Parse subtitles from JSON format and return list with start/end times.
+
+    Input: list of {"start": float, "end": float, "text": str}
+    Output: list of {"start": float, "end": float, "text": str}
+
+    Supports multiple key formats for time fields: start/end, start_sec/end_sec, start_time/end_time
+    Supports multiple key formats for text field: text, subtitle_text, content, caption
+    """
+    if not subtitles_data:
+        return []
+    parsed = []
+    for sub in subtitles_data:
+        # Support alternative time field names
+        start = sub.get("start", sub.get("start_sec", sub.get("start_time", 0)))
+        end = sub.get("end", sub.get("end_sec", sub.get("end_time", start + 1)))
+        # Support alternative text field names
+        text = sub.get("text", sub.get("subtitle_text", sub.get("content", sub.get("caption", "")))).strip()
+        if text:
+            parsed.append({"start": start, "end": end, "text": text})
+    return parsed
+
+
+def format_source_scene_id(scene_num: int) -> str:
+    """Format scene number to immutable scene_src_XXXX pattern."""
+    return f"{SCENE_SRC_PREFIX}{scene_num:04d}"
+
+
+def extract_scene_number(scene_id: str) -> int:
+    """Extract numeric part from scene_src_XXXX or scene_XXXX."""
+    try:
+        num = int(re.search(r'(\d+)', str(scene_id)).group(1))
+        return num
+    except (AttributeError, ValueError):
+        return 0
+
+
+def times_overlap(scene_start: float, scene_end: float,
+                  item_start: float, item_end: float) -> bool:
+    """Check if two time ranges overlap."""
+    return item_start < scene_end and item_end > scene_start
+
+
+def enrich_scenes_with_context(scenes: List[Dict],
+                               subtitles: List[Dict],
+                               audio_regions: List[Dict]) -> List[Dict]:
+    """Enrich each scene with subtitle and audio context using timeline overlap.
+
+    For each scene, find overlapping subtitles and audio regions.
+    - subtitle_text: concatenated text of all overlapping subtitles
+    - has_subtitle: True if any subtitle overlaps
+    - audio_type: dominant audio type (speech/music/silence)
+    - audio_energy: average energy of overlapping audio regions
+    """
+    for scene in scenes:
+        scene_start = scene.get("start_time", 0)
+        scene_end = scene_start + scene.get("duration", 0)
+
+        # Find overlapping subtitles
+        overlapping_subs = []
+        for sub in subtitles:
+            sub_start = sub.get("start", 0)
+            sub_end = sub.get("end", sub_start + 1)
+            if times_overlap(scene_start, scene_end, sub_start, sub_end):
+                overlapping_subs.append(sub.get("text", ""))
+        scene["subtitle_text"] = " ".join(overlapping_subs)
+        scene["has_subtitle"] = len(overlapping_subs) > 0
+
+        # Find overlapping audio regions
+        overlapping_audio = []
+        for region in audio_regions:
+            reg_start = region.get("start", 0)
+            reg_end = region.get("end", reg_start + 1)
+            if times_overlap(scene_start, scene_end, reg_start, reg_end):
+                overlapping_audio.append(region)
+
+        # Determine dominant audio type and average energy
+        if overlapping_audio:
+            type_counts = {}
+            total_energy = 0
+            for reg in overlapping_audio:
+                audio_type = reg.get("type", "silence")
+                type_counts[audio_type] = type_counts.get(audio_type, 0) + 1
+                total_energy += reg.get("energy", 0)
+            if type_counts.get("speech", 0) > 0:
+                scene["audio_type"] = "speech"
+            elif type_counts.get("high_energy", 0) > 0:
+                scene["audio_type"] = "music"
+            elif type_counts.get("silence", 0) > 0:
+                scene["audio_type"] = "silence"
+            else:
+                scene["audio_type"] = list(type_counts.keys())[0] if type_counts else "unknown"
+            scene["audio_energy"] = round(total_energy / len(overlapping_audio), 3)
+        else:
+            scene["audio_type"] = "unknown"
+            scene["audio_energy"] = 0.0
+    return scenes
+
+
+def fetch_ollama_models(base_url: str) -> List[str]:
+    """Fetch model list from Ollama /api/tags endpoint."""
+    import requests
+    try:
+        response = requests.get(f"{base_url}/api/tags", timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        models = [m.get("name", "") for m in data.get("models", [])]
+        return [m for m in models if m]  # Filter empty strings
+    except Exception as e:
+        print(f"Failed to fetch Ollama models: {e}")
+        return []
+
+
+def fetch_openai_models(base_url: str) -> List[str]:
+    """Fetch model list from OpenAI-compatible /v1/models endpoint."""
+    import requests
+    try:
+        response = requests.get(f"{base_url}/v1/models", timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        models = [m.get("id", "") for m in data.get("data", [])]
+        return [m for m in models if m]  # Filter empty strings
+    except Exception as e:
+        print(f"Failed to fetch OpenAI models: {e}")
+        return []
+
+
+def _parse_semantic_fields(block_text: str, result: dict, require_markers: bool = True) -> dict:
+    """Parse key=value semantic fields from block text into result dictionary.
+
+    This is a standalone helper that populates result["semantic"] fields.
+
+    Args:
+        block_text: Raw text containing key=value pairs
+        result: Result dict with "semantic" key containing fields dict
+        require_markers: If True, only parse lines that look like key=value fields
+
+    Returns:
+        The result dict with populated semantic fields
+    """
+    sem = result["semantic"]
+    for line in block_text.strip().split('\n'):
+        line = line.strip()
+        if '=' not in line:
+            continue
+        key, _, value = line.partition('=')
+        key = key.strip()
+        value = value.strip()
+
+        if key == "scene_summary":
+            sem["scene_summary"] = value
+        elif key == "shot_type":
+            sem["shot_type"] = value
+        elif key == "characters":
+            sem["characters"] = [c.strip() for c in value.split(',') if c.strip()]
+        elif key == "actions":
+            sem["actions"] = [a.strip() for a in value.split(',') if a.strip()]
+        elif key == "environment":
+            sem["environment"] = value
+        elif key == "creatures":
+            sem["creatures"] = [c.strip() for c in value.split(',') if c.strip()]
+        elif key == "objects":
+            sem["objects"] = [o.strip() for o in value.split(',') if o.strip()]
+        elif key == "visibility":
+            sem["visibility"] = value
+        elif key == "confidence":
+            sem["confidence"] = value
+        # Also parse timeline overrides from OUTPUT_BLOCK if present
+        elif key == "scene_start":
+            try:
+                result["timeline"]["start"] = float(value)
+            except Exception:
+                pass
+        elif key == "scene_end":
+            try:
+                result["timeline"]["end"] = float(value)
+            except Exception:
+                pass
+    return result
+
+
+def _has_valid_output_block(raw_output: str) -> bool:
+    """Check if raw_output contains a valid non-empty OUTPUT_BLOCK.
+    
+    A valid block must have:
+    - <<OUTPUT_BLOCK>> and <</OUTPUT_BLOCK>> markers
+    - At least one key=value field parsed from the content
+    
+    Returns True only if both conditions are met.
+    """
+    if not raw_output or not raw_output.strip():
+        return False
+    block_match = re.search(
+        r'<<OUTPUT_BLOCK>>\s*(.*?)\s*<</OUTPUT_BLOCK>>',
+        raw_output, re.DOTALL | re.IGNORECASE
+    )
+    if not block_match:
+        return False
+    block_text = block_match.group(1).strip()
+    if not block_text:
+        return False
+    # Check for at least one key=value pair
+    for line in block_text.split('\n'):
+        line = line.strip()
+        if '=' in line and len(line) > 3:
+            return True
+    return False
+
+
+def save_phase1_scene_analysis(package_dir: str, scene: dict, raw_output: str,
+                                analysis_model: str = "gemma",
+                                prompt_version: str = "P1",
+                                parsed_semantic: dict = None) -> Path:
+    """Save Phase 1 scene analysis to output/<video_name>/analysis/scene_src_XXXX.json.
+
+    Immutable source identity preserved via scene_src_XXXX naming.
+    All semantic exports remain package-local.
+
+    Format matches the Phase 1 specification exactly:
+    - scene_id (source_scene_id from SceneFlow.py timeline)
+    - timeline (start, end, duration)
+    - subtitle (exists, text)
+    - audio (type, energy)
+    - semantic (scene_summary, shot_type, characters, creatures, actions, environment, objects, visibility, confidence)
+    - raw_model_output (PRESERVED UNTOUCHED - original AI response)
+    - analysis_model
+    - prompt_version
+
+    SAFETY: If OUTPUT_BLOCK is missing/empty, does NOT overwrite existing analysis.
+    Logs the missing block count and returns existing path if it exists.
+
+    Args:
+        package_dir: Path to package directory (output/<video_name>/)/
+        scene: Scene metadata dict
+        raw_output: ORIGINAL AI response (PRESERVED UNTOUCHED)
+        analysis_model: Model used for analysis
+        prompt_version: Prompt version identifier
+        parsed_semantic: Optional pre-parsed semantic fields (from batch mode)
+                        If provided, used directly instead of re-parsing raw_output
+    """
+    analysis_dir = get_analysis_dir(package_dir)
+    ensure_dir(str(analysis_dir))
+
+    # Use source_scene_id if available, otherwise derive from scene id
+    scene_id = scene.get("source_scene_id", scene.get("id", "unknown"))
+    scene_num = extract_scene_number(scene_id)
+    source_id = format_source_scene_id(scene_num)
+    out_path = analysis_dir / f"{source_id}.json"
+
+    # ALWAYS build metadata (does not depend on OUTPUT_BLOCK)
+    metadata = {
+        "scene_id": source_id,
+        "frame_file": scene.get("frame", scene.get("path", "")),
+        "analysis_file": str(out_path),
+        "duration": round(scene.get("duration", 0), 3),
+        "scene_start": round(scene.get("start_time", 0), 3),
+        "scene_end": round(scene.get("end_time", scene.get("start_time", 0) + scene.get("duration", 0)), 3),
+        "audio_type": scene.get("audio_type", "unknown"),
+        "audio_energy": scene.get("audio_energy", 0.0),
+        "subtitle": scene.get("subtitle_text", "")
+    }
+
+    result = {
+        "metadata": metadata,
+        "scene_id": source_id,
+        "source_scene_id": scene_id,
+        "timeline": {
+            "start": round(scene.get("start_time", 0), 3),
+            "end": round(scene.get("end_time", 0), 3),
+            "duration": round(scene.get("duration", 0), 3)
+        },
+        "subtitle": {
+            "exists": scene.get("has_subtitle", False),
+            "text": scene.get("subtitle_text", "")
+        },
+        "audio": {
+            "type": scene.get("audio_type", "unknown"),
+            "energy": scene.get("audio_energy", 0.0)
+        },
+        "semantic": {
+            "scene_summary": "",
+            "shot_type": "",
+            "characters": [],
+            "creatures": [],
+            "actions": [],
+            "environment": "",
+            "objects": [],
+            "visibility": "",
+            "confidence": "pending"
+        },
+        "raw_model_output": raw_output,  # PRESERVED UNTOUCHED
+        "analysis_model": analysis_model,
+        "prompt_version": prompt_version
+    }
+
+    # Use pre-parsed semantic if provided (batch mode, OPTIONAL)
+    if parsed_semantic and isinstance(parsed_semantic, dict):
+        sem = result["semantic"]
+        sem["scene_summary"] = parsed_semantic.get("scene_summary", "")
+        sem["shot_type"] = parsed_semantic.get("shot_type", "")
+        sem["characters"] = parsed_semantic.get("characters", [])
+        sem["creatures"] = parsed_semantic.get("creatures", [])
+        sem["actions"] = parsed_semantic.get("actions", [])
+        sem["environment"] = parsed_semantic.get("environment", "")
+        sem["objects"] = parsed_semantic.get("objects", [])
+        sem["visibility"] = parsed_semantic.get("visibility", "")
+        sem["confidence"] = parsed_semantic.get("confidence", "pending")
+    else:
+        # Parse from raw_output using OUTPUT_BLOCK markers (OPTIONAL)
+        block_match = re.search(
+            r'<<OUTPUT_BLOCK>>\s*(.*?)\s*<</OUTPUT_BLOCK>>',
+            raw_output, re.DOTALL | re.IGNORECASE
+        )
+        if block_match:
+            block_text = block_match.group(1)
+            _parse_semantic_fields(block_text, result)
+
+    # ALWAYS save metadata + raw_output + json
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    return out_path
+
+
+def save_scene_groups(package_dir: str, groups: dict) -> Path:
+    """Save scene groups to output/<video_name>/analysis/scene_groups.json."""
+    analysis_dir = get_analysis_dir(package_dir)
+    ensure_dir(str(analysis_dir))
+    out_path = analysis_dir / "scene_groups.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(groups, f, indent=2, ensure_ascii=False)
+    return out_path
+
+
+def call_ai_provider(prompt: str, image_paths: List[str], model: str,
+                    provider: str, base_url: str) -> str:
+    """Call Ollama or OpenAI-compatible API with images."""
+    import requests
+    import base64
+
+    # Read PNG files and convert to base64
+    images_b64 = []
+    for img_path in image_paths:
+        with open(img_path, "rb") as f:
+            images_b64.append(base64.b64encode(f.read()).decode("utf-8"))
+
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        if provider == "ollama":
+            # Ollama uses "images" array at message level (not embedded in content)
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                    "images": images_b64
+                }],
+                "stream": False
+            }
+            print(f"[DEBUG] Ollama request payload keys: {list(payload.keys())}")
+            print(f"[DEBUG] Message keys: {list(payload['messages'][0].keys())}")
+            print(f"[DEBUG] Images count: {len(payload['messages'][0].get('images', []))}")
+            response = requests.post(
+                f"{base_url}/api/chat",
+                json=payload,
+                headers=headers,
+                timeout=300
+            )
+            print(f"[DEBUG] Ollama response status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"[DEBUG] Ollama error: {response.text}")
+            response.raise_for_status()
+            return response.json().get("message", {}).get("content", "")
+        else:  # openai-compatible
+            # OpenAI uses content array with image_url objects
+            content = [{"type": "text", "text": prompt}]
+            for img_b64 in images_b64:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                })
+            payload = {
+                "model": model,
+                "content": [{"role": "user", "content": content}],
+                "stream": False
+            }
+            print(f"[DEBUG] OpenAI request payload keys: {list(payload.keys())}")
+            response = requests.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=300
+            )
+            print(f"[DEBUG] OpenAI response status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"[DEBUG] OpenAI error: {response.text}")
+            response.raise_for_status()
+            return response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as e:
+        return f"ERROR: API call failed: {str(e)}"
+
+
+def call_ai_text_only(prompt: str, model: str, provider: str, base_url: str) -> str:
+    """Call Ollama or OpenAI-compatible API with text only (no images)."""
+    import requests
+
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        if provider == "ollama":
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt
+                }],
+                "stream": False
+            }
+            response = requests.post(
+                f"{base_url}/api/chat",
+                json=payload,
+                headers=headers,
+                timeout=300
+            )
+            response.raise_for_status()
+            return response.json().get("message", {}).get("content", "")
+        else:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False
+            }
+            response = requests.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=300
+            )
+            response.raise_for_status()
+            return response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as e:
+        return f"ERROR: API call failed: {str(e)}"
+
+
+def parse_raw_output(raw_text: str) -> str:
+    """Extract the first OUTPUT_BLOCK from the raw model response.
+    Returns the block content text (including the <<OUTPUT_BLOCK>> markers),
+    or the full raw text if no block found.
+    """
+    block_pattern = re.compile(
+        r'(<<OUTPUT_BLOCK>>\s*.*?\s*<</OUTPUT_BLOCK>>)',
+        re.DOTALL | re.IGNORECASE
+    )
+    match = block_pattern.search(raw_text)
+    if match:
+        return match.group(1).strip()
+    return raw_text.strip()
+
+
+def load_package_data(package_dir: str) -> Dict:
+    """Load a runtime package directory and return structured data.
+
+    Expected SceneFlow.py contract (IMMUTABLE):
+    packages/       - scene packages
+    frames/         - PNG frame files
+    runtime_timeline.json - ACTIVE FILTERED RUNTIME DATABASE
+    runtime_manifest.json - package metadata
+    source_subtitles.json - source subtitles from SceneFlow.py
+    source_audio_regions.json - source audio regions from SceneFlow.py
+
+    NO legacy contracts:
+    metadata/       - REMOVED
+    audio/          - REMOVED
+    manifest.json   - REMOVED
+    audio_regions.json - REMOVED
+    subtitles_filtered.srt - REMOVED
+
+    Returns dict with keys:
+        - manifest: parsed runtime_manifest.json (or empty dict)
+        - timeline: parsed timeline.json entries (or empty list)
+        - frames: sorted list of PNG frame paths
+        - subtitles_data: parsed runtime_subtitles.json (or source_subtitles.json fallback)
+        - audio_regions: parsed runtime_audio_regions.json (or source_audio_regions.json fallback)
+    """
+    pkg = Path(package_dir)
+    result = {
+        "package_dir": str(pkg),
+        "manifest": {},
+        "timeline": [],
+        "frames": [],
+        "subtitles_data": [],
+        "audio_regions": []
+    }
+
+    # Load runtime_manifest.json (SceneFlow.py contract - ACTIVE ONLY)
+    manifest_path = pkg / "runtime_manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                result["manifest"] = json.load(f)
+        except Exception as e:
+            print(f"Failed to load runtime_manifest: {e}")
+
+    # Load runtime_timeline.json (SceneFlow.py ACTIVE FILTERED RUNTIME DATABASE)
+    # ONLY load from this contract - NO legacy timeline.json
+    timeline_path = pkg / "runtime_timeline.json"
+    if timeline_path.exists():
+        try:
+            with open(timeline_path, "r", encoding="utf-8") as f:
+                timeline_data = json.load(f)
+                # Support both list and dict formats
+                if isinstance(timeline_data, list):
+                    result["timeline"] = timeline_data
+                elif isinstance(timeline_data, dict):
+                    # PRIMARY: "scenes" key (actual runtime_timeline.json contract)
+                    # FALLBACK: "entries" or "segments" (legacy contracts)
+                    result["timeline"] = timeline_data.get("scenes",
+                                        timeline_data.get("entries",
+                                        timeline_data.get("segments", [])))
+        except Exception as e:
+            print(f"Failed to load runtime_timeline: {e}")
+
+    # Load frames from frames/ directory
+    frames_dir = pkg / "frames"
+    if frames_dir.exists() and frames_dir.is_dir():
+        for f in sorted(frames_dir.iterdir()):
+            if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                result["frames"].append(str(f))
+
+    # Load runtime_subtitles.json (NEW SceneFlow.py runtime contract)
+    # This is the ACTIVE filtered subtitle database
+    subtitles_path = pkg / "runtime_subtitles.json"
+    if subtitles_path.exists():
+        try:
+            with open(subtitles_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                # Debug: log top-level keys
+                if isinstance(raw, dict):
+                    print(f"[DEBUG] runtime_subtitles.json keys: {list(raw.keys())}")
+                # Can be list or dict with known key formats
+                if isinstance(raw, list):
+                    result["subtitles_data"] = parse_subtitle_json(raw)
+                    print(f"[DEBUG] Loaded runtime subtitles (list): {len(result['subtitles_data'])} entries")
+                elif isinstance(raw, dict):
+                    # Support multiple key formats: subtitles, scenes, segments, entries, data, items
+                    # "scenes" is the ACTUAL runtime export format: {"scenes": [{"scene_id": "...", "subtitles": [...]}]}
+                    subs = raw.get("subtitles",
+                           raw.get("scenes",
+                           raw.get("segments",
+                           raw.get("entries",
+                           raw.get("data",
+                           raw.get("items", []))))))
+                    if subs:
+                        # Detect "scenes" format: list of {scene_id, subtitles: [...]} with nested subtitles
+                        if isinstance(subs, list) and len(subs) > 0 and isinstance(subs[0], dict) and "subtitles" in subs[0]:
+                            flat_subs = []
+                            for scene_obj in subs:
+                                scene_subs = scene_obj.get("subtitles", [])
+                                flat_subs.extend(scene_subs)
+                            result["subtitles_data"] = parse_subtitle_json(flat_subs)
+                            print(f"[DEBUG] Loaded runtime subtitles (scenes format): {len(result['subtitles_data'])} entries")
+                        else:
+                            result["subtitles_data"] = parse_subtitle_json(subs)
+                            print(f"[DEBUG] Loaded runtime subtitles: {len(result['subtitles_data'])} entries")
+                    else:
+                        print(f"[WARNING] Unknown runtime_subtitles.json structure. Keys: {list(raw.keys())}")
+        except Exception as e:
+            print(f"Failed to load runtime_subtitles: {e}")
+
+    # Fallback: try old contract if new contract not found
+    if not result.get("subtitles_data"):
+        old_subtitles_path = pkg / "source_subtitles.json"
+        if old_subtitles_path.exists():
+            try:
+                with open(old_subtitles_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, dict):
+                        print(f"[DEBUG] source_subtitles.json keys: {list(raw.keys())}")
+                    if isinstance(raw, list):
+                        result["subtitles_data"] = parse_subtitle_json(raw)
+                    elif isinstance(raw, dict):
+                        subs = raw.get("subtitles",
+                               raw.get("segments",
+                               raw.get("entries",
+                               raw.get("data",
+                               raw.get("items", [])))))
+                        result["subtitles_data"] = parse_subtitle_json(subs)
+            except Exception as e:
+                print(f"Failed to load source_subtitles (fallback): {e}")
+
+    # Load runtime_audio_regions.json (NEW SceneFlow.py runtime contract)
+    # This is the ACTIVE filtered audio regions database
+    audio_regions_path = pkg / "runtime_audio_regions.json"
+    result["audio_regions"] = []
+    if audio_regions_path.exists():
+        try:
+            with open(audio_regions_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                # Debug: log top-level keys
+                if isinstance(raw, dict):
+                    print(f"[DEBUG] runtime_audio_regions.json keys: {list(raw.keys())}")
+                # Can be list or dict with known key formats
+                if isinstance(raw, list):
+                    result["audio_regions"] = raw
+                    print(f"[DEBUG] Loaded runtime audio regions (list): {len(result['audio_regions'])} entries")
+                elif isinstance(raw, dict):
+                    # Support multiple key formats: audio_regions, regions, entries, data, items
+                    audio_data = raw.get("audio_regions",
+                                raw.get("regions",
+                                raw.get("scenes",
+                                raw.get("entries",
+                                raw.get("data",
+                                raw.get("items", []))))))
+                    if audio_data:
+                        # Detect "scenes" format: list of scene objects with nested audio regions
+                        if isinstance(audio_data, list) and len(audio_data) > 0 and isinstance(audio_data[0], dict) and ("audio_regions" in audio_data[0] or "regions" in audio_data[0]):
+                            flat_regions = []
+                            for scene_obj in audio_data:
+                                scene_regions = scene_obj.get("audio_regions", scene_obj.get("regions", []))
+                                flat_regions.extend(scene_regions)
+                            result["audio_regions"] = flat_regions
+                        else:
+                            result["audio_regions"] = audio_data
+                        print(f"[DEBUG] Loaded runtime audio regions: {len(result['audio_regions'])} entries")
+                    else:
+                        print(f"[WARNING] Unknown runtime_audio_regions.json structure. Keys: {list(raw.keys())}")
+        except Exception as e:
+            print(f"Failed to load runtime_audio_regions: {e}")
+
+    # Fallback: try old contract if new contract not found
+    if not result.get("audio_regions"):
+        old_audio_regions_path = pkg / "source_audio_regions.json"
+        if old_audio_regions_path.exists():
+            try:
+                with open(old_audio_regions_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, dict):
+                        print(f"[DEBUG] source_audio_regions.json keys: {list(raw.keys())}")
+                    if isinstance(raw, list):
+                        result["audio_regions"] = raw
+                    elif isinstance(raw, dict):
+                        audio_data = raw.get("audio_regions",
+                                    raw.get("regions",
+                                    raw.get("entries",
+                                    raw.get("data",
+                                    raw.get("items", [])))))
+                        result["audio_regions"] = audio_data
+            except Exception as e:
+                print(f"Failed to load source_audio_regions (fallback): {e}")
+
+    return result
+
+
+def build_scene_list_from_package(package_data: Dict) -> List[Dict]:
+    """Build a scene list from loaded package data.
+
+    Uses SceneFlow.py runtime_timeline.json which is the ACTIVE FILTERED RUNTIME DATABASE.
+    Each entry contains:
+    - runtime_scene_index
+    - source_scene_id
+    - frame_path
+    - filtered
+    - filtered_reason
+    - start_sec
+    - end_sec
+    - duration
+
+    Each built scene entry contains:
+        - id: source_scene_id (scene_src_XXXX)
+        - source_scene_id: original source scene id
+        - name: display name
+        - path: path to representative frame image
+        - duration: scene duration in seconds
+        - timeline_entry: original timeline entry data
+        - frame: path to the PNG frame used for preview
+        - start_time: scene start time from timeline
+        - end_time: scene end time from timeline
+        - subtitle_text: overlapping subtitle text
+        - has_subtitle: True if subtitle overlaps
+        - audio_type: dominant audio type
+        - audio_energy: average energy
+    """
+    scenes = []
+    frames = package_data.get("frames", [])
+    timeline = package_data.get("timeline", [])
+
+    if timeline:
+        # Build scene list from timeline entries, matching frames by source_scene_id
+        for i, entry in enumerate(timeline):
+            # SceneFlow.py timeline contract: runtime_scene_index and source_scene_id
+            raw_scene_id = entry.get("source_scene_id", entry.get("scene_id", i))
+
+            # PART 2: Normalize source_scene_id from int to immutable scene_src_XXXX
+            # runtime_timeline.json stores source_scene_id as int (e.g. 15)
+            # semantic pipeline requires scene_src_XXXX format (e.g. scene_src_0015)
+            if isinstance(raw_scene_id, int):
+                scene_id = format_source_scene_id(raw_scene_id)
+            else:
+                scene_num = extract_scene_number(raw_scene_id)
+                scene_id = format_source_scene_id(scene_num) if scene_num > 0 else str(raw_scene_id)
+
+            scene_name = entry.get("name", entry.get("label", scene_id))
+
+            # PART 3: Get timing - PRIMARY: start_time/end_time, FALLBACK: start_sec/end_sec
+            # runtime_timeline.json uses start_time/end_time; fall back to start_sec/end_sec
+            start_time = entry.get("start_time", entry.get("start_sec", entry.get("start", 0)))
+            end_time = entry.get("end_time", entry.get("end_sec", entry.get("end", 0)))
+            duration = entry.get("duration", 0.0)
+            if duration <= 0 and end_time > start_time:
+                duration = end_time - start_time
+
+            # Match frame to scene using scene_src_XXXX pattern
+            frame_path = None
+            scene_num = extract_scene_number(scene_id)
+            src_pattern = format_source_scene_id(scene_num)
+            for fp in frames:
+                fp_stem = Path(fp).stem
+                if src_pattern in fp_stem or scene_id in fp_stem:
+                    frame_path = fp
+                    break
+
+            scenes.append({
+                "id": scene_id,
+                "source_scene_id": scene_id,
+                "name": scene_name,
+                "path": frame_path,
+                "duration": duration,
+                "start_time": start_time,
+                "end_time": end_time,
+                "timeline_entry": entry,
+                "frame": frame_path or entry.get("frame_path"),
+                "subtitle_text": "",
+                "has_subtitle": False,
+                "audio_type": "unknown",
+                "audio_energy": 0.0
+            })
+    else:
+        # Fallback: use frames directly as scene list
+        # Extract source_scene_id from frame filenames (scene_src_XXXX.png)
+        for fp in frames:
+            fp_stem = Path(fp).stem
+            # Try to extract scene number from frame filename
+            scene_num_search = re.search(r'(\d+)', fp_stem)
+            if scene_num_search:
+                scene_num = int(scene_num_search.group(1))
+                src_id = format_source_scene_id(scene_num)
+            else:
+                # No numeric pattern in filename - use stem as id
+                src_id = fp_stem
+            scenes.append({
+                "id": src_id,
+                "source_scene_id": src_id,
+                "name": Path(fp).stem,
+                "path": fp,
+                "duration": 0,
+                "start_time": 0,
+                "end_time": 0,
+                "timeline_entry": {},
+                "frame": fp,
+                "subtitle_text": "",
+                "has_subtitle": False,
+                "audio_type": "unknown",
+                "audio_energy": 0.0
+            })
+
+    # Enrich scenes with subtitle and audio context
+    subtitles = package_data.get("subtitles_data", [])
+    audio_regions = package_data.get("audio_regions", [])
+    scenes = enrich_scenes_with_context(scenes, subtitles, audio_regions)
+
+    return scenes
+
+
+# ============================================================================
+# OLLAMA WORKER THREAD
+# ============================================================================
+
+class ModelFetchWorker(QThread):
+    """Worker thread for fetching available models."""
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, provider: str, base_url: str):
+        super().__init__()
+        self.provider = provider
+        self.base_url = base_url
+
+    def run(self):
+        try:
+            if self.provider == "ollama":
+                models = fetch_ollama_models(self.base_url)
+            else:
+                models = fetch_openai_models(self.base_url)
+            self.finished.emit(models)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class OllamaWorker(QThread):
+    finished = Signal(str)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, prompt: str, image_paths: List[str], model: str,
+                 provider: str, base_url: str):
+        super().__init__()
+        self.prompt = prompt
+        self.image_paths = image_paths
+        self.model = model
+        self.provider = provider
+        self.base_url = base_url
+
+    def run(self):
+        try:
+            self.progress.emit(f"Connecting to {self.provider}...")
+            result = call_ai_provider(
+                self.prompt, self.image_paths,
+                self.model, self.provider, self.base_url
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+class PackageLoader(QMainWindow):
+    """Main window for Scene Package Loader.
+    Loads exported runtime packages from SceneFlow.py for semantic analysis.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Scene Package Loader")
+        self.setGeometry(100, 100, 1400, 900)
+
+        # State
+        self.current_package_dir = None
+        self.package_data = {}
+        self.scene_list = []
+        self.selected_scene = None
+        self.prompts = DEFAULT_PROMPTS.copy()
+        self._batch_analyze_index = 0
+
+        # Batch worker - MUST be instance var to prevent GC crash
+        self.batch_worker = None
+
+        # RB3.8A: Batch queue for sequential scene analysis
+        self._batch_queue = None
+        self._batch_running = False
+
+        # Analysis state tracking: scene_id -> status (unanalyzed/processing/complete/failed)
+        self._scene_analysis_states = {}
+
+        # Batch runtime tracking
+        self._batch_start_time = None
+        self._batch_timer = None
+        self._batch_current_scene_num = None  # 1-based for display
+        self._batch_total_scenes = 0
+        self._batch_current_scene = None  # RB3.8A2: Batch owns scene independently of UI selection
+        self._batch_current_scenes = []  # RB3.8E: Current batch of scenes for multi-scene request
+
+        # Batch size configuration (configurable via UI, range 1-100, default 5)
+        self.batch_size = 5
+
+        # Batch worker state
+        self._batch_scene_start = 0  # Start index for current batch
+        self._batch_scene_end = 0   # End index (exclusive) for current batch
+
+        # RB3.8B: Runtime lock state - prevents re-entry during analysis
+        # Values: "IDLE" | "RUNNING_SINGLE" | "RUNNING_BATCH"
+        self._v3_runtime_state = "IDLE"
+
+        # AI Provider settings
+        self.provider = DEFAULT_PROVIDER
+        self.base_url = DEFAULT_BASE_URL
+        self.model_name = DEFAULT_MODEL
+        self.available_models = []
+
+        ensure_dir(PROMPTS_DIR)
+        self._load_config()
+        self._load_saved_prompts()
+        
+        # Load profile state for module persistence
+        self._profile = _load_profile()
+        self._module_states = {}  # module_name -> {"enabled": bool, "priority": int}
+        self._load_module_states_from_profile()
+        
+        self._setup_ui()
+        self._refresh_models()
+        self.statusBar().showMessage("Ready - Load a package to begin")
+    
+    def _load_module_states_from_profile(self):
+        """Load module states (enabled/priority) from profile."""
+        profile_modules = self._profile.get("modules", {})
+        for module_name, state in profile_modules.items():
+            self._module_states[module_name] = {
+                "enabled": state.get("enabled", True),
+                "priority": state.get("priority", 100)
+            }
+    
+    def _save_module_states_to_profile(self):
+        """Save current module states to profile file."""
+        profile_modules = {}
+        for module_name, state in self._module_states.items():
+            profile_modules[module_name] = {
+                "filename": f"{module_name}.txt",
+                "enabled": state.get("enabled", True),
+                "priority": state.get("priority", 100)
+            }
+        self._profile["modules"] = profile_modules
+        _save_profile(self._profile)
+    
+    def _get_next_priority(self) -> int:
+        """Get the next available priority number."""
+        priorities = [s.get("priority", 100) for s in self._module_states.values()]
+        return max(priorities) + 10 if priorities else 10
+
+    # -------------------------------------------------------------------------
+    # PROFILE MANAGEMENT (RB3.3)
+    # -------------------------------------------------------------------------
+
+    def _refresh_profile_combo(self) -> None:
+        """Refresh the profile dropdown with available profiles."""
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        
+        # Always add Default first
+        self.profile_combo.addItem("Default")
+        
+        # Add other profiles from storage
+        profiles = _load_profile_list()
+        for p in profiles:
+            self.profile_combo.addItem(p)
+        
+        self.profile_combo.blockSignals(False)
+
+    def _on_profile_changed(self, profile_name: str) -> None:
+        """Handle profile dropdown selection change."""
+        # Auto-load on selection change
+        pass  # User must click Load to apply
+
+    def _new_profile(self) -> None:
+        """Create a new profile with a default name."""
+        i = 1
+        while True:
+            name = f"Profile_{i}"
+            if not Path(PROFILES_DIR, f"{name}.json").exists():
+                break
+            i += 1
+        
+        # Create profile from current state
+        profile = self._build_profile_from_current_state()
+        _save_named_profile(name, profile)
+        
+        # Refresh combo and select new profile
+        self._refresh_profile_combo()
+        self.profile_combo.setCurrentText(name)
+
+    def _rename_profile(self) -> None:
+        """Rename the currently selected profile."""
+        current = self.profile_combo.currentText()
+        if current == "Default":
+            QMessageBox.warning(self, "Protected", "Cannot rename Default profile.")
+            return
+        
+        new_name, ok = QInputDialog.getText(self, "Rename Profile", 
+            f"Enter new name for '{current}':")
+        if not ok or not new_name:
+            return
+        
+        new_name = new_name.strip()
+        if not new_name:
+            return
+        
+        # Load current profile data
+        profile_path = Path(PROFILES_DIR) / f"{current}.json"
+        if profile_path.exists():
+            try:
+                with open(profile_path, "r", encoding="utf-8") as f:
+                    profile = json.load(f)
+                
+                # Delete old file and save with new name
+                profile_path.unlink()
+                _save_named_profile(new_name, profile)
+                
+                self._refresh_profile_combo()
+                self.profile_combo.setCurrentText(new_name)
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to rename: {e}")
+
+    def _delete_profile(self) -> None:
+        """Delete the currently selected profile."""
+        current = self.profile_combo.currentText()
+        if current == "Default":
+            QMessageBox.warning(self, "Protected", "Cannot delete Default profile.")
+            return
+        
+        reply = QMessageBox.question(self, "Delete Profile",
+            f"Delete profile '{current}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        if _delete_named_profile(current):
+            self._refresh_profile_combo()
+            self.profile_combo.setCurrentText("Default")
+
+    def _save_profile_action(self) -> None:
+        """Save current module states to the selected profile."""
+        current = self.profile_combo.currentText()
+        
+        profile = self._build_profile_from_current_state()
+        _save_named_profile(current, profile)
+        
+        self.statusBar().showMessage(f"Profile '{current}' saved", 2000)
+
+    def _load_profile_action(self) -> None:
+        """Load the selected profile and apply module states."""
+        current = self.profile_combo.currentText()
+        profile = _load_named_profile(current)
+        
+        # Apply module states from profile
+        if "modules" in profile:
+            for name, state in profile["modules"].items():
+                self._module_states[name] = {
+                    "enabled": state.get("enabled", True),
+                    "priority": state.get("priority", 100),
+                    "order": state.get("order", 0)
+                }
+        
+        # Rebuild UI
+        self._refresh_module_list()
+        
+        # RB3.3.X FIX: Sync preview with loaded enabled states (was at wrong indentation before)
+        self._update_final_prompt_preview()
+        
+        self.statusBar().showMessage(f"Profile '{current}' loaded", 2000)
+
+    def _build_profile_from_current_state(self) -> dict:
+        """Build a profile dict from current module states.
+        
+        Uses SINGLE SOURCE OF TRUTH: _get_module_order() for consistent ordering.
+        """
+        sorted_names = self._get_module_order()
+        
+        modules = {}
+        for i, name in enumerate(sorted_names):
+            state = self._module_states.get(name, {"enabled": True, "priority": 100})
+            modules[name] = {
+                "enabled": state.get("enabled", True),
+                "priority": state.get("priority", 100),
+            }
+        
+        return {"modules": modules}
+
+    # -------------------------------------------------------------------------
+    # UI BUILDERS
+    # -------------------------------------------------------------------------
+
+    def _setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        layout.addWidget(self._create_top_bar())
+
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.addWidget(self._create_left_panel())
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.addWidget(self._create_center_panel())
+        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.addWidget(self._create_right_panel())
+        self.main_splitter.setStretchFactor(2, 2)
+        layout.addWidget(self.main_splitter)
+
+        self.bottom_splitter_widget = self._create_bottom_panel()
+        layout.addWidget(self.bottom_splitter_widget)
+        layout.addWidget(self._create_bottom_action_bar())
+        
+        # Restore UI layout after all widgets created
+        self._restore_ui_layout()
+
+    def _create_top_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setMaximumHeight(50)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        # Package path section
+        layout.addWidget(QLabel("Package:"))
+        self.package_path_label = QLabel("Not loaded")
+        self.package_path_label.setStyleSheet("color: gray;")
+        self.package_path_label.setMinimumWidth(150)
+        layout.addWidget(self.package_path_label)
+
+        load_package_btn = QPushButton("Load Package")
+        load_package_btn.setMaximumWidth(90)
+        load_package_btn.clicked.connect(self.load_package_folder)
+        layout.addWidget(load_package_btn)
+
+        layout.addSpacing(16)
+
+        # AI Provider section - grouped controls
+        provider_group = QWidget()
+        provider_layout = QHBoxLayout(provider_group)
+        provider_layout.setContentsMargins(0, 0, 0, 0)
+        provider_layout.setSpacing(6)
+
+        # Provider selector
+        provider_layout.addWidget(QLabel("Provider:"))
+        self.provider_combo = QComboBox()
+        self.provider_combo.setMinimumWidth(110)
+        self.provider_combo.addItems(["ollama", "openai"])
+        self.provider_combo.setCurrentText(self.provider)
+        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
+        provider_layout.addWidget(self.provider_combo)
+
+        # Base URL input
+        provider_layout.addWidget(QLabel("URL:"))
+        self.base_url_input = QTextEdit()
+        self.base_url_input.setMaximumHeight(24)
+        self.base_url_input.setPlainText(self.base_url)
+        self.base_url_input.textChanged.connect(self._on_base_url_changed)
+        provider_layout.addWidget(self.base_url_input)
+
+        # Refresh models button
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setMaximumWidth(75)
+        refresh_btn.clicked.connect(self._refresh_models)
+        provider_layout.addWidget(refresh_btn)
+
+        # Model selector
+        provider_layout.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(140)
+        self.model_combo.currentTextChanged.connect(self._on_model_changed)
+        provider_layout.addWidget(self.model_combo)
+
+        layout.addWidget(provider_group)
+        layout.addStretch()
+
+        return bar
+
+    def _create_left_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        lbl = QLabel("SCENES")
+        lbl.setStyleSheet("font-weight: bold; color: #aaa;")
+        layout.addWidget(lbl)
+
+        self.scene_list_widget = QListWidget()
+        self.scene_list_widget.itemClicked.connect(self._on_scene_selected)
+        self.scene_list_widget.currentRowChanged.connect(self._on_scene_row_changed)
+        layout.addWidget(self.scene_list_widget)
+
+        info_group = QGroupBox("Selected Scene Info")
+        info_layout = QVBoxLayout(info_group)
+        self.scene_info_label = QLabel("No scene selected")
+        self.scene_info_label.setWordWrap(True)
+        self.scene_info_label.setStyleSheet("color: #888;")
+        info_layout.addWidget(self.scene_info_label)
+        layout.addWidget(info_group)
+
+        return panel
+
+    def _create_center_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # Package frame display - load PNG directly
+        layout.addWidget(self._make_label("PACKAGE FRAME"))
+        self.frame_display_label = self._make_frame_label("FRAME")
+        layout.addWidget(self.frame_display_label)
+
+        # Scene preview - shows selected scene frame
+        pg = QGroupBox("SCENE PREVIEW")
+        pgl = QVBoxLayout(pg)
+        self.preview_label = QLabel("Select a scene to preview")
+        self.preview_label.setMinimumHeight(180)
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setStyleSheet("border: 1px solid #444; background: #111; color: #666;")
+        pgl.addWidget(self.preview_label)
+        layout.addWidget(pg)
+        layout.setStretchFactor(self.frame_display_label, 1)
+        layout.setStretchFactor(pg, 1)
+        layout.addStretch()
+        return panel
+
+    def _make_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("font-weight: bold; color: #aaa;")
+        return lbl
+
+    def _make_frame_label(self, title: str) -> QLabel:
+        lbl = QLabel(f"{title}\nNo frame")
+        lbl.setMinimumSize(180, 120)
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet("border: 1px solid #444; background: #1a1a1a; color: #666;")
+        return lbl
+
+    def _create_right_panel(self) -> QWidget:
+        """Right panel - Prompt Module Manager UI (RB3.2)."""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # === PROFILE AREA (RB3.3) ===
+        profile_group = QGroupBox("PROFILE")
+        profile_layout = QVBoxLayout(profile_group)
+        profile_layout.setSpacing(6)
+        
+        # Profile selector row - combo full width
+        selector_layout = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        selector_layout.addWidget(QLabel("Profile:"))
+        selector_layout.addWidget(self.profile_combo)
+        profile_layout.addLayout(selector_layout)
+        
+        # Profile button row - SINGLE ROW, equal sizing, centered
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(4)
+        
+        new_btn = QPushButton("New")
+        new_btn.clicked.connect(self._new_profile)
+        btn_layout.addWidget(new_btn)
+        
+        rename_btn = QPushButton("Rename")
+        rename_btn.clicked.connect(self._rename_profile)
+        btn_layout.addWidget(rename_btn)
+        
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self._delete_profile)
+        btn_layout.addWidget(delete_btn)
+        
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self._save_profile_action)
+        btn_layout.addWidget(save_btn)
+        
+        load_btn = QPushButton("Load")
+        load_btn.clicked.connect(self._load_profile_action)
+        btn_layout.addWidget(load_btn)
+        
+        profile_layout.addLayout(btn_layout)
+        
+        layout.addWidget(profile_group)
+        
+        # Initialize profile combo
+        self._refresh_profile_combo()
+
+        # === PROMPT MODULE MANAGER (RB3.2) ===
+        
+        # Header
+        header_lbl = QLabel("PROMPT MODULE MANAGER")
+        header_lbl.setStyleSheet("font-weight: bold; color: #aaa;")
+        layout.addWidget(header_lbl)
+
+        # Module directory path display
+        self.module_dir_label = QLabel(f"Directory: {PROMPTS_DIR}/modules/")
+        self.module_dir_label.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(self.module_dir_label)
+
+        # Module table (scrollable) with Order, Filename, Enabled columns
+        self.module_table = QTableWidget()
+        self.module_table.setMaximumHeight(300)
+        self.module_table.setColumnCount(3)
+        self.module_table.setHorizontalHeaderLabels(["Order", "Filename", "Enabled"])
+        self.module_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.module_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.module_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.module_table.horizontalHeader().setStretchLastSection(True)
+        self.module_table.setColumnWidth(0, 60)
+        self.module_table.setColumnWidth(1, 200)
+        self.module_table.itemClicked.connect(self._on_module_selected)
+        layout.addWidget(self.module_table)
+
+        # Button row for module operations - SINGLE ROW, equal sizing, centered
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(4)
+
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add_module)
+        btn_layout.addWidget(add_btn)
+
+        rename_btn = QPushButton("Rename")
+        rename_btn.clicked.connect(self._rename_module)
+        btn_layout.addWidget(rename_btn)
+
+        duplicate_btn = QPushButton("Duplicate")
+        duplicate_btn.clicked.connect(self._duplicate_module)
+        btn_layout.addWidget(duplicate_btn)
+
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self._delete_module)
+        btn_layout.addWidget(delete_btn)
+
+        move_up_btn = QPushButton("Up")
+        move_up_btn.clicked.connect(self._on_move_up)
+        btn_layout.addWidget(move_up_btn)
+
+        move_down_btn = QPushButton("Down")
+        move_down_btn.clicked.connect(self._on_move_down)
+        btn_layout.addWidget(move_down_btn)
+
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self._edit_module)
+        btn_layout.addWidget(edit_btn)
+
+        # Push buttons to left, checkbox to right
+        btn_layout.addStretch()
+        
+        self.module_enabled_checkbox = QCheckBox("Enabled")
+        self.module_enabled_checkbox.stateChanged.connect(self._on_module_enabled_toggle)
+        btn_layout.addWidget(self.module_enabled_checkbox)
+
+        layout.addLayout(btn_layout)
+
+        # Module preview area
+        preview_group = QGroupBox("Module Preview")
+        preview_layout = QVBoxLayout(preview_group)
+        self.module_preview_text = QTextEdit()
+        self.module_preview_text.setReadOnly(True)
+        self.module_preview_text.setMaximumHeight(120)
+        self.module_preview_text.setStyleSheet("font-family: monospace; font-size: 10px; background: #1a1a1a; color: #9cdcfe;")
+        preview_layout.addWidget(self.module_preview_text)
+        layout.addWidget(preview_group)
+
+        # Current module tracking (no duplicate declaration - set in __init__)
+        self._current_module = None
+
+        # Load modules on init
+        self._refresh_module_list()
+
+        layout.addStretch()
+        return panel
+
+    def _get_modules_dir(self) -> Path:
+        """Get the modules directory path, creating if needed."""
+        modules_dir = Path(PROMPTS_DIR) / "modules"
+        modules_dir.mkdir(parents=True, exist_ok=True)
+        return modules_dir
+
+    def _get_module_order(self) -> List[str]:
+        """Get ordered module names based on priority.
+        
+        SINGLE SOURCE OF TRUTH for module ordering.
+        All ordering operations MUST use this function.
+        
+        Order is based solely on priority values from _module_states.
+        Modules without priority get default 100.
+        """
+        return sorted(
+            self._module_states.keys(),
+            key=lambda m: self._module_states.get(m, {}).get("priority", 100)
+        )
+
+    def _compile_final_prompt(self) -> str:
+        """Compile final prompt from enabled modules and metadata registry.
+        
+        Single Compiler - the ONE compiler that generates final prompt text.
+        Reads TXT modules in order, skips disabled, merges content,
+        appends metadata section.
+        
+        Returns:
+            str: The compiled final prompt string.
+        """
+        modules_dir = self._get_modules_dir()
+        module_order = self._get_module_order()
+        
+        parts = []
+        
+        for module_name in module_order:
+            state = self._module_states.get(module_name, {})
+            if not state.get("enabled", True):
+                continue
+            
+            module_path = modules_dir / f"{module_name}.txt"
+            if module_path.exists():
+                try:
+                    with open(module_path, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        parts.append(content)
+                except Exception:
+                    continue
+        
+        # Append metadata section (safe access - may not be initialized)
+        registry = getattr(self, 'metadata_registry', None) or {}
+        if registry:
+            metadata_lines = ["", "---", "SCENE METADATA"]
+            for key, value in registry.items():
+                if value is not None and str(value).strip():
+                    metadata_lines.append(f"{key}={value}")
+            parts.append("\n".join(metadata_lines))
+        
+        final_prompt = "\n\n".join(parts)
+        return final_prompt
+
+    def _refresh_module_list(self):
+        """Refresh the module table from prompts_scene_analyzer/modules/ directory.
+
+        Uses SINGLE SOURCE OF TRUTH: _get_module_order() for consistent ordering.
+        Shows: Order (A/B/C), Filename, Enabled columns.
+        Preserves existing enable/disable states across refreshes.
+        New modules default to enabled with unique priority.
+        Removed modules are purged from state.
+        """
+        modules_dir = self._get_modules_dir()
+        current_modules = set()
+        
+        # Only load .txt files from top level (ignore subfolders)
+        for f in sorted(modules_dir.iterdir()):
+            if f.is_file() and f.suffix == ".txt":
+                module_name = f.stem
+                current_modules.add(module_name)
+                
+                # Preserve existing state, set default enabled + unique priority for new modules
+                if module_name not in self._module_states:
+                    self._module_states[module_name] = {
+                        "enabled": True,
+                        "priority": self._get_next_priority()
+                    }
+        
+        # Purge states for modules that no longer exist on disk
+        deleted_modules = [m for m in self._module_states if m not in current_modules]
+        for m in deleted_modules:
+            del self._module_states[m]
+        
+        # Use SINGLE SOURCE OF TRUTH for ordering
+        sorted_modules = self._get_module_order()
+        
+        # Rebuild table
+        self.module_table.blockSignals(True)
+        self.module_table.setRowCount(len(sorted_modules))
+        
+        for row, module_name in enumerate(sorted_modules):
+            state = self._module_states.get(module_name, {"enabled": True, "priority": 100})
+            enabled = state.get("enabled", True)
+            
+            # Order column - display letter label based on row position
+            # Row 0 = A, Row 1 = B, Row 2 = C, etc.
+            order_label = chr(ord('A') + row)
+            order_item = QTableWidgetItem(order_label)
+            order_item.setTextAlignment(Qt.AlignCenter)
+            order_item.setData(Qt.UserRole, module_name)  # Store module name for lookup
+            if not enabled:
+                order_item.setForeground(Qt.gray)
+            self.module_table.setItem(row, 0, order_item)
+            
+            # Filename column
+            name_item = QTableWidgetItem(module_name)
+            if not enabled:
+                name_item.setForeground(Qt.gray)
+            self.module_table.setItem(row, 1, name_item)
+            
+            # Enabled column
+            enabled_item = QTableWidgetItem("✓" if enabled else "✗")
+            enabled_item.setTextAlignment(Qt.AlignCenter)
+            enabled_item.setForeground(Qt.green if enabled else Qt.red)
+            self.module_table.setItem(row, 2, enabled_item)
+        
+        self.module_table.blockSignals(False)
+
+    def _on_module_selected(self, item):
+        """Handle module selection from table."""
+        if not item:
+            return
+        row = item.row()
+        name_item = self.module_table.item(row, 1)
+        if not name_item:
+            return
+        self._current_module = name_item.text()
+        
+        # Load and display module preview
+        self._load_module_preview(self._current_module)
+        
+        # Update move button states
+        self._update_move_button_states()
+
+    def _load_module_preview(self, module_name: str):
+        """Load and preview a module file."""
+        modules_dir = self._get_modules_dir()
+        module_path = modules_dir / f"{module_name}.txt"
+        
+        if module_path.exists():
+            try:
+                with open(module_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                self.module_preview_text.setPlainText(content[:500] + ("..." if len(content) > 500 else ""))
+            except Exception as e:
+                self.module_preview_text.setPlainText(f"Error loading module: {e}")
+        else:
+            self.module_preview_text.setPlainText("Module file not found")
+
+    def _on_move_up(self):
+        """Move selected module up (decrease priority number)."""
+        if not self._current_module:
+            QMessageBox.information(self, "No Selection", "Select a module to move.")
+            return
+        
+        current_priority = self._module_states[self._current_module].get("priority", 100)
+        
+        # Find module with next lower priority (the one above)
+        # Uses SINGLE SOURCE OF TRUTH: _get_module_order()
+        sorted_modules = self._get_module_order()
+        
+        # Find current index
+        try:
+            current_idx = sorted_modules.index(self._current_module)
+        except ValueError:
+            return
+        
+        if current_idx == 0:
+            # Already at top
+            return
+        
+        # Swap priorities with the module above
+        above_module = sorted_modules[current_idx - 1]
+        above_priority = self._module_states[above_module].get("priority", 100)
+        
+        self._module_states[self._current_module]["priority"] = above_priority
+        self._module_states[above_module]["priority"] = current_priority
+        
+        # Save to profile
+        self._save_module_states_to_profile()
+        
+        # Refresh display
+        self._refresh_module_list()
+        self._log(f"Moved '{self._current_module}' up")
+        
+        # Re-select current module
+        self._reselect_current_module()
+        
+        # RB3.6C: Refresh preview after move operation
+        self._update_final_prompt_preview()
+
+    def _on_move_down(self):
+        """Move selected module down (increase priority number)."""
+        if not self._current_module:
+            QMessageBox.information(self, "No Selection", "Select a module to move.")
+            return
+        
+        # Find module with next higher priority (the one below)
+        # Uses SINGLE SOURCE OF TRUTH: _get_module_order()
+        sorted_modules = self._get_module_order()
+        
+        # Find current index
+        try:
+            current_idx = sorted_modules.index(self._current_module)
+        except ValueError:
+            return
+        
+        if current_idx >= len(sorted_modules) - 1:
+            # Already at bottom
+            return
+        
+        # Swap priorities with the module below
+        below_module = sorted_modules[current_idx + 1]
+        below_priority = self._module_states[below_module].get("priority", 100)
+        current_priority = self._module_states[self._current_module].get("priority", 100)
+        
+        self._module_states[self._current_module]["priority"] = below_priority
+        self._module_states[below_module]["priority"] = current_priority
+        
+        # Save to profile
+        self._save_module_states_to_profile()
+        
+        # Refresh display
+        self._refresh_module_list()
+        self._log(f"Moved '{self._current_module}' down")
+        
+        # Re-select current module
+        self._reselect_current_module()
+        
+        # RB3.6C: Refresh preview after move operation
+        self._update_final_prompt_preview()
+
+    def _reselect_current_module(self):
+        """Re-select the current module in the table after refresh.
+        
+        Calls selectRow to select the row, then explicitly refreshes:
+        - Module preview text
+        - Move button states
+        
+        This ensures UI fully refreshes after enable/disable and move operations.
+        """
+        for row in range(self.module_table.rowCount()):
+            name_item = self.module_table.item(row, 1)
+            if name_item and name_item.text() == self._current_module:
+                self.module_table.selectRow(row)
+                
+                # Explicitly refresh preview (selectRow does NOT trigger itemClicked)
+                self._load_module_preview(self._current_module)
+                self._update_move_button_states()
+                
+                break
+    
+    def _update_move_button_states(self):
+        """Update enabled/disabled state of move buttons based on position."""
+        if not self._current_module:
+            return
+        
+        # Uses SINGLE SOURCE OF TRUTH: _get_module_order()
+        sorted_modules = self._get_module_order()
+        
+        try:
+            current_idx = sorted_modules.index(self._current_module)
+        except ValueError:
+            return
+        
+        # Get move buttons from layout (they're in the btn_layout)
+        # We don't have direct references, so we'll just let click handlers check
+        pass
+
+    def _add_module(self):
+        """Add a new module."""
+        from PySide6.QtWidgets import QInputDialog
+        
+        modules_dir = self._get_modules_dir()
+        
+        # Generate default name
+        existing = [f.stem for f in modules_dir.iterdir() if f.is_file() and f.suffix == ".txt"]
+        counter = 1
+        while f"new_module_{counter}" in existing:
+            counter += 1
+        default_name = f"new_module_{counter}"
+        
+        # Get name from user
+        name, ok = QInputDialog.getText(self, "Add Module", "Enter module name:")
+        if not ok or not name:
+            return
+        
+        # Sanitize name
+        name = "".join(c for c in name if c.isalnum() or c in "_-")
+        if not name:
+            QMessageBox.warning(self, "Invalid Name", "Module name must be alphanumeric.")
+            return
+        
+        module_path = modules_dir / f"{name}.txt"
+        if module_path.exists():
+            QMessageBox.warning(self, "Exists", f"Module '{name}' already exists.")
+            return
+        
+        # Create empty module with unique priority (no duplicate defaults)
+        try:
+            with open(module_path, "w", encoding="utf-8") as f:
+                f.write(f"# {name}\n# Add your prompt content here\n")
+            # Assign unique priority using _get_next_priority()
+            self._module_states[name] = {
+                "enabled": True,
+                "priority": self._get_next_priority()
+            }
+            self._save_module_states_to_profile()
+            self._refresh_module_list()
+            self._log(f"Added module: {name}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to create module: {e}")
+
+    def _rename_module(self):
+        """Rename the selected module."""
+        if not self._current_module:
+            QMessageBox.information(self, "No Selection", "Select a module to rename.")
+            return
+        
+        from PySide6.QtWidgets import QInputDialog
+        
+        old_name = self._current_module
+        new_name, ok = QInputDialog.getText(self, "Rename Module", "Enter new name:", text=old_name)
+        if not ok or not new_name:
+            return
+        
+        # Sanitize name
+        new_name = "".join(c for c in new_name if c.isalnum() or c in "_-")
+        if not new_name:
+            QMessageBox.warning(self, "Invalid Name", "Module name must be alphanumeric.")
+            return
+        
+        if new_name == old_name:
+            return
+        
+        modules_dir = self._get_modules_dir()
+        old_path = modules_dir / f"{old_name}.txt"
+        new_path = modules_dir / f"{new_name}.txt"
+        
+        if new_path.exists():
+            QMessageBox.warning(self, "Exists", f"Module '{new_name}' already exists.")
+            return
+        
+        try:
+            old_path.rename(new_path)
+            
+            # Transfer state
+            state = self._module_states.pop(old_name, {"enabled": True})
+            self._module_states[new_name] = state
+            
+            self._current_module = new_name
+            self._refresh_module_list()
+            self._log(f"Renamed module: {old_name} -> {new_name}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to rename module: {e}")
+
+    def _duplicate_module(self):
+        """Duplicate the selected module."""
+        if not self._current_module:
+            QMessageBox.information(self, "No Selection", "Select a module to duplicate.")
+            return
+        
+        modules_dir = self._get_modules_dir()
+        source_name = self._current_module
+        source_path = modules_dir / f"{source_name}.txt"
+        
+        # Generate new name
+        counter = 1
+        while modules_dir / f"{source_name}_copy_{counter}.txt":
+            if not (modules_dir / f"{source_name}_copy_{counter}.txt").exists():
+                break
+            counter += 1
+        
+        new_name = f"{source_name}_copy_{counter}"
+        new_path = modules_dir / f"{new_name}.txt"
+        
+        try:
+            shutil.copy2(source_path, new_path)
+            
+            # Copy state but assign UNIQUE priority to avoid collisions
+            source_state = self._module_states.get(source_name, {"enabled": True})
+            self._module_states[new_name] = {
+                "enabled": source_state.get("enabled", True),
+                "priority": self._get_next_priority()
+            }
+            
+            self._save_module_states_to_profile()
+            self._current_module = new_name
+            self._refresh_module_list()
+            self._log(f"Duplicated module: {source_name} -> {new_name}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to duplicate module: {e}")
+
+    def _delete_module(self):
+        """Delete the selected module."""
+        if not self._current_module:
+            QMessageBox.information(self, "No Selection", "Select a module to delete.")
+            return
+        
+        module_name = self._current_module
+        
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Delete module '{module_name}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        modules_dir = self._get_modules_dir()
+        module_path = modules_dir / f"{module_name}.txt"
+        
+        try:
+            module_path.unlink()
+            self._module_states.pop(module_name, None)
+            self._current_module = None
+            self.module_preview_text.clear()
+            self._refresh_module_list()
+            self._log(f"Deleted module: {module_name}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to delete module: {e}")
+
+
+    def _edit_module(self):
+        """Edit the selected module in an external editor."""
+        if not self._current_module:
+            QMessageBox.information(self, "No Selection", "Select a module to edit.")
+            return
+        
+        modules_dir = self._get_modules_dir()
+        module_path = modules_dir / f"{self._current_module}.txt"
+        
+        if not module_path.exists():
+            QMessageBox.warning(self, "Not Found", "Module file not found.")
+            return
+        
+        try:
+            # Open in default text editor
+            import subprocess
+            if sys.platform == "win32":
+                os.startfile(str(module_path))
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(module_path)])
+            else:
+                subprocess.run(["xdg-open", str(module_path)])
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to open editor: {e}")
+
+
+    def _on_module_enabled_toggle(self, state: int):
+        """Toggle enabled state for the selected module from the action bar checkbox."""
+        if not self._current_module:
+            self.module_enabled_checkbox.setCheckState(2)  # default checked
+            return
+        is_enabled = state == 2  # Qt.Checked == 2
+        if self._current_module in self._module_states:
+            self._module_states[self._current_module]["enabled"] = is_enabled
+            self._refresh_module_list()
+            self._log(f"Module '{self._current_module}' enabled={is_enabled}")
+        # RB3.6C: Refresh preview after state change
+        self._update_final_prompt_preview()
+
+
+    def _create_bottom_panel(self) -> QWidget:
+        # Container for bottom area
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Horizontal splitter: LEFT = output tabs, RIGHT = prompt workspace
+        self.bottom_splitter = QSplitter(Qt.Horizontal)
+
+        # === LEFT: OUTPUT TABS ===
+        self.output_tabs = QTabWidget()
+
+        self.raw_output_text = QTextEdit()
+        self.raw_output_text.setReadOnly(True)
+        self.raw_output_text.setStyleSheet("font-family: monospace; background: #1e1e1e; color: #d4d4d4;")
+        self.output_tabs.addTab(self.raw_output_text, "Raw Output")
+
+        self.clean_output_text = QTextEdit()
+        self.clean_output_text.setReadOnly(True)
+        self.clean_output_text.setStyleSheet("font-family: monospace; background: #1e1e1e; color: #9cdcfe;")
+        self.output_tabs.addTab(self.clean_output_text, "Clean Output")
+
+        self.logs_text = QTextEdit()
+        self.logs_text.setReadOnly(True)
+        self.logs_text.setStyleSheet("font-family: monospace; background: #0d0d0d; color: #00ff00;")
+        self.output_tabs.addTab(self.logs_text, "Logs")
+
+        self.bottom_splitter.addWidget(self.output_tabs)
+
+        # === RIGHT: PROMPT WORKSPACE (RB3.3.6 Tab Refactor) ===
+        prompt_panel = QWidget()
+        prompt_layout = QVBoxLayout(prompt_panel)
+        prompt_layout.setContentsMargins(4, 4, 4, 4)
+        prompt_layout.setSpacing(8)
+
+        # Header
+        header_lbl = QLabel("PROMPT WORKSPACE")
+        header_lbl.setStyleSheet("font-weight: bold; color: #aaa; font-size: 11px;")
+        prompt_layout.addWidget(header_lbl)
+
+        # Tab Widget: Final Prompt / Metadata
+        self.prompt_workspace_tabs = QTabWidget()
+
+        # Tab 1: Final Prompt (default selected, index 0)
+        self.final_prompt_text = QTextEdit()
+        self.final_prompt_text.setReadOnly(True)
+        self.final_prompt_text.setPlaceholderText("RB3.5 Reserved")
+        self.final_prompt_text.setStyleSheet("""
+            QTextEdit {
+                font-family: monospace;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #333;
+            }
+        """)
+        self.prompt_workspace_tabs.addTab(self.final_prompt_text, "Final Prompt")
+
+        # Tab 2: Metadata
+        self.metadata_text = QTextEdit()
+        self.metadata_text.setReadOnly(True)
+        self.metadata_text.setPlaceholderText("RB3.4 Reserved")
+        self.metadata_text.setStyleSheet("""
+            QTextEdit {
+                font-family: monospace;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #333;
+            }
+        """)
+        self.prompt_workspace_tabs.addTab(self.metadata_text, "Metadata")
+
+        # Set Final Prompt as default tab
+        self.prompt_workspace_tabs.setCurrentIndex(0)
+
+        prompt_layout.addWidget(self.prompt_workspace_tabs)
+
+        self.bottom_splitter.addWidget(prompt_panel)
+
+        # Set initial sizes (output 60%, prompt 40%)
+        self.bottom_splitter.setSizes([400, 250])
+
+        layout.addWidget(self.bottom_splitter)
+
+        return container
+
+    def _create_bottom_action_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setMaximumHeight(45)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        self.analyze_v3_btn = QPushButton("Analyze Scene V3")
+        self.analyze_v3_btn.clicked.connect(self._analyze_scene_v3)
+        self.analyze_v3_btn.setEnabled(False)
+        layout.addWidget(self.analyze_v3_btn)
+
+        # RB3.8A: Analyze All Scenes V3 button
+        self.analyze_all_v3_btn = QPushButton("Analyze All Scenes V3")
+        self.analyze_all_v3_btn.clicked.connect(self._analyze_all_scenes_v3)
+        self.analyze_all_v3_btn.setEnabled(False)
+        layout.addWidget(self.analyze_all_v3_btn)
+
+        # RB3.8B: Cancel V3 button - enabled during batch only
+        self.cancel_v3_btn = QPushButton("Cancel V3")
+        self.cancel_v3_btn.clicked.connect(self._cancel_v3)
+        self.cancel_v3_btn.setEnabled(False)
+        layout.addWidget(self.cancel_v3_btn)
+
+        # RB3.8C: Batch Size control
+        layout.addWidget(QLabel("Batch Size:"))
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setMinimum(1)
+        self.batch_size_spin.setMaximum(999)
+        self.batch_size_spin.setValue(getattr(self, 'batch_size', 2))
+        self.batch_size_spin.valueChanged.connect(self._on_batch_size_changed)
+        layout.addWidget(self.batch_size_spin)
+
+        layout.addStretch()
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # RB3.8C: Batch progress labels
+        self._batch_current_label = QLabel("")
+        self._batch_current_label.setVisible(False)
+        self._batch_current_label.setStyleSheet("color: #ffa500; font-weight: bold;")
+        layout.addWidget(self._batch_current_label)
+
+        self._batch_progress_label = QLabel("")
+        self._batch_progress_label.setVisible(False)
+        layout.addWidget(self._batch_progress_label)
+
+        return bar
+
+    # -------------------------------------------------------------------------
+    # PACKAGE LOADING
+    # -------------------------------------------------------------------------
+
+    def load_package_folder(self):
+        """Load a runtime package directory exported by SceneFlow.py."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Package Directory",
+            str(Path.cwd() / "output")
+        )
+        if not folder:
+            return
+
+        self.current_package_dir = folder
+        self.package_path_label.setText(folder)
+        self.package_path_label.setStyleSheet("color: #0f0;")
+
+        # Validate package structure (NEW runtime contract)
+        pkg_path = Path(folder)
+        has_frames = (pkg_path / "frames").exists()
+        has_timeline = (pkg_path / "runtime_timeline.json").exists()
+        has_manifest = (pkg_path / "runtime_manifest.json").exists()
+
+        if not has_frames and not has_timeline:
+            self._log("WARNING: Package structure incomplete - missing frames/ and runtime_timeline.json")
+
+        # Load the package data
+        self.package_data = load_package_data(folder)
+        self.scene_list = build_scene_list_from_package(self.package_data)
+
+        # SCAN existing analysis files to restore analyzed states
+        analysis_dir = get_analysis_dir(folder)
+        existing_analysis = {}
+        if analysis_dir.exists():
+            for af in analysis_dir.glob(f"{SCENE_SRC_PREFIX}*.json"):
+                scene_num = extract_scene_number(af.stem)
+                source_id = format_source_scene_id(scene_num)
+                existing_analysis[source_id] = str(af)
+
+        # Initialize analysis states - restore from existing analysis files
+        self._scene_analysis_states = {}
+        # Populate scene list widget
+        self.scene_list_widget.clear()
+        manifest_display = self.package_data.get("manifest", {}).get("video_name",
+                         self.package_data.get("manifest", {}).get("name", "Package"))
+
+        for scene in self.scene_list:
+            dur = scene['duration']
+            dur_str = f" ({dur:.1f}s)" if dur > 0 else ""
+            # Build context indicators
+            indicators = []
+            if scene.get("has_subtitle"):
+                indicators.append("[SUB]")
+            audio_type = scene.get("audio_type", "unknown")
+            if audio_type == "music":
+                indicators.append("[MUSIC]")
+            elif audio_type == "silence" or audio_type == "silent":
+                indicators.append("[SILENCE]")
+            ind_str = " " + " ".join(indicators) if indicators else ""
+            
+            # RESTORE analysis state from existing analysis files
+            scene_id = scene['id']
+            if scene_id in existing_analysis:
+                self._scene_analysis_states[scene_id] = "complete"
+                indicators.append("[OK]")
+                ind_str = " " + " ".join(indicators) if indicators else ""
+            else:
+                self._scene_analysis_states[scene_id] = "unanalyzed"
+            
+            self.scene_list_widget.addItem(f"{scene['name']}{dur_str}{ind_str}")
+
+        # Refresh UI indicators after scene list population completes
+        self._refresh_scene_list_indicators()
+
+        # Log package info
+        frames_count = len(self.package_data.get("frames", []))
+        timeline_count = len(self.package_data.get("timeline", []))
+        has_subtitles = "Yes" if self.package_data.get("subtitles_data") else "No"
+        has_audio = "Yes" if self.package_data.get("audio_regions") else "No"
+
+        self._log(f"Loaded package: {manifest_display}")
+        self._log(f"  Frames: {frames_count}")
+        self._log(f"  Timeline entries: {timeline_count}")
+        self._log(f"  Timeline source: runtime_timeline.json")
+        # Track actual loaded file for accurate logging
+        subtitles_file = "runtime_subtitles.json" if (Path(folder) / "runtime_subtitles.json").exists() else "source_subtitles.json"
+        audio_file = "runtime_audio_regions.json" if (Path(folder) / "runtime_audio_regions.json").exists() else "source_audio_regions.json"
+        subtitles_count = len(self.package_data.get("subtitles_data", []))
+        audio_count = len(self.package_data.get("audio_regions", []))
+        self._log(f"  Subtitles: {has_subtitles} ({subtitles_file})")
+        self._log(f"  Loaded runtime subtitles: {subtitles_count}")
+        self._log(f"  Audio regions: {has_audio} ({audio_file})")
+        self._log(f"  Loaded runtime audio regions: {audio_count}")
+
+        has = len(self.scene_list) > 0
+        self.analyze_v3_btn.setEnabled(has)
+
+        if has:
+            self._log(f"Loaded {len(self.scene_list)} scene(s) from package")
+
+        # FIX A5.2: Auto-select first scene to restore Raw/Clean Output
+        if self.scene_list_widget.count() > 0:
+            self.scene_list_widget.setCurrentRow(0)
+            self._on_scene_selected()
+
+    # -------------------------------------------------------------------------
+    # UI EVENTS
+    # -------------------------------------------------------------------------
+
+    def _on_provider_changed(self, provider: str):
+        """Handle provider selection change."""
+        self.provider = provider
+        self._log(f"Provider changed to: {provider}")
+        self._refresh_models()
+        self._save_config()
+
+    def _on_base_url_changed(self):
+        """Handle base URL text change."""
+        self.base_url = self.base_url_input.toPlainText().strip()
+        self._save_config()
+
+    def _refresh_models(self):
+        """Fetch available models from current provider."""
+        self._log(f"Fetching models from {self.provider} at {self.base_url}...")
+        self.model_fetch_worker = ModelFetchWorker(self.provider, self.base_url)
+        self.model_fetch_worker.finished.connect(self._on_models_loaded)
+        self.model_fetch_worker.error.connect(self._on_models_error)
+        self.model_fetch_worker.start()
+
+    def _on_models_loaded(self, models: List[str]):
+        """Handle models loaded successfully."""
+        self.available_models = models
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        if models:
+            self.model_combo.addItems(models)
+            # Restore selected model if still available
+            if self.model_name in models:
+                self.model_combo.setCurrentText(self.model_name)
+            else:
+                self.model_combo.setCurrentIndex(0)
+                self.model_name = self.model_combo.currentText()
+            self._log(f"Loaded {len(models)} models")
+        else:
+            self.model_combo.addItem("(no models found)")
+            self._log("No models found")
+        self.model_combo.blockSignals(False)
+
+    def _on_models_error(self, error: str):
+        """Handle model fetch error."""
+        self._log(f"Model fetch error: {error}")
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItem("(fetch error)")
+        self.model_combo.blockSignals(False)
+
+    def _on_scene_selected(self, _item=None):
+        idx = self.scene_list_widget.currentRow()
+        if 0 <= idx < len(self.scene_list):
+            self.selected_scene = self.scene_list[idx]
+            self._load_scene_analysis_for_display()
+            self._update_scene_preview()
+            self._update_metadata_registry()
+            # RB3.6C: Refresh preview after metadata refresh
+            self._update_final_prompt_preview()
+            # RB3.8B: Enable buttons via centralized lock state
+            self._update_runtime_lock_state()
+            self._log(f"Selected scene: {self.selected_scene['name']}")
+
+    def _on_scene_row_changed(self, _current_row):
+        """Handle keyboard Up/Down navigation on scene list.
+        
+        Fires same callback chain as _on_scene_selected to sync all UI panels.
+        """
+        idx = self.scene_list_widget.currentRow()
+        if 0 <= idx < len(self.scene_list):
+            self.selected_scene = self.scene_list[idx]
+            self._load_scene_analysis_for_display()
+            self._update_scene_preview()
+            self._update_metadata_registry()
+            self._update_final_prompt_preview()
+            self._update_runtime_lock_state()
+            self._log(f"KB nav selected scene: {self.selected_scene['name']}")
+
+    def _load_scene_analysis_for_display(self):
+        """Load saved analysis from analysis/scene_src_XXXX.json and display in output panels.
+
+        This ensures Raw Output works identically in both single and batch mode.
+        All analysis data is loaded directly from saved files.
+        """
+        if not self.selected_scene or not self.current_package_dir:
+            return
+
+        scene = self.selected_scene
+        scene_id = scene.get('id', scene.get('source_scene_id', ''))
+
+        # Get immutable scene_src_XXXX filename
+        scene_num = extract_scene_number(scene_id)
+        source_id = format_source_scene_id(scene_num)
+        analysis_file = get_analysis_dir(self.current_package_dir) / f"{source_id}.json"
+
+        if not analysis_file.exists():
+            # No saved analysis yet
+            self.raw_output_text.setPlainText("")
+            self.clean_output_text.setPlainText("")
+            return
+
+        try:
+            with open(analysis_file, "r", encoding="utf-8") as f:
+                analysis_data = json.load(f)
+
+            # Load raw_model_output for Raw Output tab
+            raw_output = analysis_data.get("raw_model_output", "")
+            self.raw_output_text.setPlainText(raw_output)
+
+            # Extract and display OUTPUT_BLOCK in Clean Output tab
+            clean_block = parse_raw_output(raw_output)
+            self.clean_output_text.setPlainText(clean_block)
+
+            self._log(f"Loaded analysis from {analysis_file.name}")
+
+        except Exception as e:
+            self._log(f"Failed to load analysis file: {e}")
+            self.raw_output_text.setPlainText("")
+            self.clean_output_text.setPlainText("")
+
+
+    def _update_scene_preview(self):
+        """Update scene preview using pre-exported PNG frame from package."""
+        if not self.selected_scene:
+            return
+
+        s = self.selected_scene
+        frame_path = s.get('frame') or s.get('path')
+        dur = s['duration']
+        dur_str = f"{dur:.1f}s" if dur > 0 else "N/A"
+        timeline_entry = s.get('timeline_entry', {})
+
+        # Get timeline info
+        start_time = s.get('start_time', 0)
+        end_time = s.get('end_time', 0)
+        if timeline_entry:
+            start_time = timeline_entry.get("start_sec", timeline_entry.get("start", start_time))
+            end_time = timeline_entry.get("end_sec", timeline_entry.get("end", end_time))
+
+        # Get subtitle info
+        subtitle_text = s.get("subtitle_text", "")
+        has_subtitle = s.get("has_subtitle", False)
+
+        # Get audio info
+        audio_type = s.get("audio_type", "unknown")
+        audio_energy = s.get("audio_energy", 0.0)
+
+        # Get analysis state
+        scene_id = s['id']
+        analysis_state = self._scene_analysis_states.get(scene_id, "unanalyzed")
+
+        # Build structured info panel
+        info_parts = [
+            f"<b>Scene:</b> {s['name']}",
+            f"<b>Timeline:</b> {start_time:.1f}s -> {end_time:.1f}s",
+            f"<b>Duration:</b> {dur_str}"
+        ]
+
+        # Subtitle section - DISPLAY RULES per phase contract
+        if has_subtitle and subtitle_text:
+            info_parts.append(f"<b>Subtitle:</b> <span style='color:#0f0'>YES</span>")
+            info_parts.append(f"<b>Subtitle Preview:</b> <span style='color:#0ff'>{subtitle_text[:80]}{'...' if len(subtitle_text) > 80 else ''}</span>")
+        else:
+            info_parts.append(f"<b>Subtitle:</b> <span style='color:#f00'>NONE</span>")
+
+        # Audio section - DISPLAY RULES per phase contract
+        info_parts.append(f"<b>Audio:</b> {audio_type} (energy: {audio_energy:.2f})")
+
+        # Analysis state
+        state_color = "#0f0" if analysis_state == "complete" else "#ff0" if analysis_state == "processing" else "#f00" if analysis_state == "failed" else "#888"
+        info_parts.append(f"<b>Analysis:</b> <span style='color:{state_color}'>{analysis_state.upper()}</span>")
+
+        info = "<br>".join(info_parts)
+        if frame_path:
+            info += f"<br><br><b>Frame:</b> {Path(frame_path).name}"
+        self.scene_info_label.setText(info)
+        self.scene_info_label.setStyleSheet("color: #ccc;")
+
+        # Load and display the PNG frame directly
+        if frame_path and os.path.exists(frame_path):
+            pixmap = QPixmap(frame_path)
+            if not pixmap.isNull():
+                # Display in frame display label
+                scaled = pixmap.scaled(
+                    self.frame_display_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.frame_display_label.setPixmap(scaled)
+                self.frame_display_label.setStyleSheet("border: 1px solid #0f0;")
+
+                # Display in preview label
+                preview_scaled = pixmap.scaled(
+                    self.preview_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.preview_label.setPixmap(preview_scaled)
+                self.preview_label.setStyleSheet("border: 1px solid #0f0;")
+
+                self._log(f"Loaded frame: {Path(frame_path).name}")
+            else:
+                self._log(f"Failed to load frame: {frame_path}")
+                self.frame_display_label.setText("Invalid image")
+                self.frame_display_label.setStyleSheet("border: 1px solid #f00;")
+                self.preview_label.setText("Invalid image")
+                self.preview_label.setStyleSheet("border: 1px solid #f00;")
+        else:
+            self._log(f"No frame available for scene: {s['name']}")
+            self.frame_display_label.clear()
+            self.frame_display_label.setText("No frame available")
+            self.frame_display_label.setStyleSheet("border: 1px solid #444; background: #1a1a1a;")
+
+    def _build_batch_metadata_registry(self, scene: dict) -> dict:
+        """Build metadata registry from a batch scene object.
+
+        RB3.8A3: Used by _analyze_all_next() to isolate compiler context.
+        This ensures batch scenes get correct metadata, not UI selected scene.
+
+        Args:
+            scene: _batch_current_scene dict with same structure as selected_scene
+
+        Returns:
+            dict: metadata registry compatible with _compile_final_prompt()
+        """
+        scene_id = scene.get('id', 'N/A')
+        frame_file = scene.get('frame') or scene.get('path', 'N/A')
+        dur = scene.get('duration', 0)
+
+        # Derive analysis file path
+        analysis_file = "N/A"
+        if self.current_package_dir:
+            scene_num = extract_scene_number(scene_id)
+            source_id = format_source_scene_id(scene_num)
+            analysis_path = get_analysis_dir(self.current_package_dir) / f"{source_id}.json"
+            if analysis_path.exists():
+                analysis_file = f"{source_id}.json"
+
+        # Get timeline info
+        timeline_entry = scene.get('timeline_entry', {})
+        start_time = scene.get('start_time', 0)
+        end_time = scene.get('end_time', 0)
+        if timeline_entry:
+            start_time = timeline_entry.get("start_sec", timeline_entry.get("start", start_time))
+            end_time = timeline_entry.get("end_sec", timeline_entry.get("end", end_time))
+
+        # Get subtitle
+        subtitle_text = scene.get("subtitle_text", "")
+        has_subtitle = scene.get("has_subtitle", False)
+        subtitle_display = subtitle_text if (has_subtitle and subtitle_text) else "N/A"
+
+        # Get audio
+        audio_type = scene.get("audio_type", "N/A")
+        audio_energy = scene.get("audio_energy", 0.0)
+        audio_energy_str = f"{audio_energy:.2f}" if audio_energy > 0 else "N/A"
+
+        # Duration
+        duration_str = f"{dur:.1f}s" if dur > 0 else "N/A"
+
+        # Scene timestamps
+        start_str = f"{start_time:.1f}s"
+        end_str = f"{end_time:.1f}s"
+
+        return {
+            "scene_id": scene_id,
+            "frame_file": Path(frame_file).name if frame_file and frame_file != "N/A" else "N/A",
+            "analysis_file": analysis_file,
+            "subtitle": subtitle_display[:100] + "..." if subtitle_display and len(subtitle_display) > 100 else subtitle_display,
+            "audio_type": audio_type,
+            "audio_energy": audio_energy_str,
+            "duration": duration_str,
+            "scene_start": start_str,
+            "scene_end": end_str
+        }
+
+    def _update_metadata_registry(self):
+        """Build runtime metadata registry from current scene and populate Metadata tab.
+
+        Registry is read-only display data. No analysis, no Ollama calls.
+        Uses already-loaded scene information only.
+        """
+        self.metadata_registry = {}
+
+        if not self.selected_scene:
+            self.metadata_text.setPlainText("No scene selected")
+            return
+
+        s = self.selected_scene
+        # Delegate to helper for core logic
+        self.metadata_registry = self._build_batch_metadata_registry(s)
+
+        # Build display text (UI-only, not used by compiler in batch mode)
+        scene_id = self.metadata_registry["scene_id"]
+        frame_file = self.metadata_registry["frame_file"]
+        analysis_file = self.metadata_registry["analysis_file"]
+        duration_str = self.metadata_registry["duration"]
+        start_str = self.metadata_registry["scene_start"]
+        end_str = self.metadata_registry["scene_end"]
+        audio_type = self.metadata_registry["audio_type"]
+        audio_energy_str = self.metadata_registry["audio_energy"]
+        subtitle_display = self.metadata_registry["subtitle"]
+
+        # Build display text
+        lines = []
+        lines.append("=" * 36)
+        lines.append("SCENE METADATA")
+        lines.append("=" * 36)
+        lines.append(f"Scene ID:")
+        lines.append(f"  {scene_id}")
+        lines.append(f"Frame:")
+        lines.append(f"  {self.metadata_registry['frame_file']}")
+        lines.append(f"Analysis File:")
+        lines.append(f"  {analysis_file}")
+        lines.append(f"Duration:")
+        lines.append(f"  {duration_str}")
+        lines.append(f"Scene Start:")
+        lines.append(f"  {start_str}")
+        lines.append(f"Scene End:")
+        lines.append(f"  {end_str}")
+        lines.append(f"Audio Type:")
+        lines.append(f"  {audio_type}")
+        lines.append(f"Audio Energy:")
+        lines.append(f"  {audio_energy_str}")
+        lines.append(f"Subtitle:")
+        if subtitle_display == "N/A":
+            lines.append(f"  N/A")
+        else:
+            for i in range(0, len(subtitle_display), 60):
+                lines.append(f"  {subtitle_display[i:i+60]}")
+        lines.append("=" * 36)
+
+        self.metadata_text.setPlainText("\n".join(lines))
+
+    # -------------------------------------------------------------------------
+    # COMPILER
+    # -------------------------------------------------------------------------
+
+    def _update_final_prompt_preview(self):
+        """Update the Final Prompt tab with compiled prompt preview.
+        
+        Readonly display only. No editing, no saving, no runtime.
+        """
+        # Guard: final_prompt_text may not exist during startup
+        if not hasattr(self, 'final_prompt_text') or not self.final_prompt_text:
+            return
+        try:
+            final_prompt = self._compile_final_prompt()
+            if final_prompt:
+                self.final_prompt_text.setPlainText(final_prompt)
+            else:
+                self.final_prompt_text.setPlainText("No prompt generated")
+        except Exception:
+            self.final_prompt_text.setPlainText("Prompt compilation failed")
+
+    # -------------------------------------------------------------------------
+    # ANALYSIS
+    # -------------------------------------------------------------------------
+
+    # RB3.8B: Runtime lock state management
+    def _update_runtime_lock_state(self):
+        """Centralized button enable/disable based on _v3_runtime_state.
+        
+        IDLE:
+            Analyze Scene V3 = ENABLED (if scene selected)
+            Analyze All Scenes V3 = ENABLED (if scenes exist)
+            Cancel V3 = DISABLED
+        
+        RUNNING_SINGLE:
+            Analyze Scene V3 = DISABLED
+            Analyze All Scenes V3 = DISABLED
+            Cancel V3 = DISABLED
+        
+        RUNNING_BATCH:
+            Analyze Scene V3 = DISABLED
+            Analyze All Scenes V3 = DISABLED
+            Cancel V3 = ENABLED
+        
+        Scene browsing is always allowed (no UI lock on scene list).
+        """
+        state = self._v3_runtime_state
+        
+        if state == "IDLE":
+            self.analyze_v3_btn.setEnabled(self.selected_scene is not None)
+            self.analyze_all_v3_btn.setEnabled(len(self.scene_list) > 0 if hasattr(self, 'scene_list') and self.scene_list else False)
+            self.cancel_v3_btn.setEnabled(False)
+        elif state == "RUNNING_SINGLE":
+            self.analyze_v3_btn.setEnabled(False)
+            self.analyze_all_v3_btn.setEnabled(False)
+            self.cancel_v3_btn.setEnabled(False)
+        elif state == "RUNNING_BATCH":
+            self.analyze_v3_btn.setEnabled(False)
+            self.analyze_all_v3_btn.setEnabled(False)
+            self.cancel_v3_btn.setEnabled(True)
+    
+    # RB3.8C: Batch size change handler
+    def _on_batch_size_changed(self, value: int):
+        self.batch_size = value
+        self._save_config()
+    
+    def _cancel_v3(self):
+        """Cancel current batch or single analysis.
+        
+        Kills the active OllamaWorker and resets state to IDLE.
+        Since cancellation is only enabled during RUNNING_BATCH,
+        we handle batch cleanup and cancel the worker if running.
+        Worker termination is best-effort via quit().
+        """
+        # CRITICAL: Use print() as fallback for trace if _log() fails
+        def _trace(msg):
+            self._log(f"[TRACE_CANCEL] {msg}")
+        
+        # TRACE: Entry point - always log this to confirm function is called
+        has_attr = hasattr(self, 'ollama_worker')
+        worker_val = getattr(self, 'ollama_worker', 'MISSING_ATTR')
+        worker_exists = worker_val is not None and worker_val != 'MISSING_ATTR'
+        worker_running = worker_val.isRunning() if worker_exists else False
+        batch_running = self._batch_running
+        runtime_state = self._v3_runtime_state if hasattr(self, '_v3_runtime_state') else 'N/A'
+        queue_len = len(self._batch_queue) if self._batch_queue else 0
+        _trace(f"ENTRY: runtime_state={runtime_state} | _batch_running={batch_running} | queue_len={queue_len} | has_attr={has_attr} | worker_exists={worker_exists} | worker_running={worker_running} | worker_val={worker_val}")
+        self._log("[CANCEL] Cancel requested")
+        
+        # Kill active worker if running
+        if has_attr and worker_exists and worker_running:
+            self._log("[CANCEL] Terminating active worker")
+            # FIX RB3.8E4B: Keep _orphaned_worker reference after wait timeout
+            # Worker thread continues synchronous HTTP request - quit() cannot
+            # interrupt it. wait(3000) will timeout. Thread continues running.
+            # To prevent "QThread: Destroyed while thread is still running" crash,
+            # keep reference alive via _orphaned_worker until callback fires.
+            try:
+                _trace(f"Before quit() - isRunning={worker_val.isRunning()}, worker={worker_val}")
+                worker_val.quit()
+                _trace(f"After quit() - isRunning={worker_val.isRunning()}")
+                wait_result = worker_val.wait(3000)  # Wait up to 3s
+                _trace(f"wait(3000) returned={wait_result} | isRunning={worker_val.isRunning()}")
+                if not wait_result:
+                    # wait() timed out - thread still running, keep reference alive
+                    _trace("wait timeout - keeping worker ref in _orphaned_worker")
+                    self._orphaned_worker = worker_val
+                    self.ollama_worker = None
+                    _trace("_orphaned_worker kept alive, self.ollama_worker=None")
+                else:
+                    # wait() succeeded - thread stopped cleanly
+                    _trace(f"Before None assignment - worker={worker_val}")
+                    self.ollama_worker = None
+                    _trace("After None assignment - worker=None")
+            except Exception as e:
+                _trace(f"Exception during quit/wait: {e}")
+                self._orphaned_worker = worker_val
+                self.ollama_worker = None
+                _trace("Exception - kept worker ref in _orphaned_worker")
+        else:
+            _trace(f"Worker branch: has_attr={has_attr} | worker_exists={worker_exists} | worker_running={worker_running}")
+            if has_attr and not worker_exists:
+                _trace("Worker is None - already cleaned up")
+            elif has_attr and not worker_running:
+                _trace("Worker exists but isRunning=False - already stopped")
+            else:
+                _trace(f"No ollama_worker attribute exists")
+        
+        # Clean up batch state
+        self._batch_running = False
+        _trace("_batch_running set to False")
+        self._batch_queue = None
+        _trace("_batch_queue set to None")
+        self._batch_current_scene = None
+        _trace("_batch_current_scene set to None")
+        self._batch_current_scenes = []
+        _trace("_batch_current_scenes cleared")
+        
+        # Reset runtime state to IDLE
+        self._v3_runtime_state = "IDLE"
+        _trace("_v3_runtime_state set to IDLE")
+        self._update_runtime_lock_state()
+        
+        self.progress_bar.setVisible(False)
+        if hasattr(self, '_batch_current_label'):
+            self._batch_current_label.setVisible(False)
+        if hasattr(self, '_batch_progress_label'):
+            self._batch_progress_label.setVisible(False)
+        self._log("[CANCEL] Analysis cancelled")
+        
+        # Restore scene browsing (already enabled, just update buttons)
+        self._refresh_scene_list_indicators()
+        _trace("Cancel complete - all state reset")
+
+    def _analyze_scene_v3(self):
+        """Single-scene V3 runtime using SingleCompiler (_compile_final_prompt).
+        
+        Reuses existing OllamaWorker, _on_ollama_finished, and save flow.
+        Only the prompt source differs from V2 (SingleCompiler vs legacy builder).
+        
+        RB3.8B: Sets runtime state to RUNNING_SINGLE at entry.
+        Restore to IDLE happens in _on_ollama_finished or _on_ollama_error.
+        """
+        if not self.selected_scene:
+            QMessageBox.warning(self, "No Scene", "Please select a scene first.")
+            return
+
+        # Lock: prevent re-entry during batch or single analysis
+        if self._v3_runtime_state != "IDLE":
+            self._log(f"[V3] BLOCKED: Runtime state is {self._v3_runtime_state}")
+            return
+
+        # Get the frame path for this scene
+        frame_path = self.selected_scene.get('frame') or self.selected_scene.get('path')
+        if not frame_path or not os.path.exists(frame_path):
+            QMessageBox.warning(self, "No Frame", "No frame available for this scene.")
+            return
+
+        scene = self.selected_scene
+        self._log(f"[V3] Analyzing scene: {scene['name']}")
+
+        # Compile prompt using SingleCompiler (no scene arg - self-contained)
+        final_prompt = self._compile_final_prompt()
+
+        # Show compiled prompt in preview
+        self.final_prompt_text.setPlainText(final_prompt)
+
+        img_paths = [frame_path]
+        self.ollama_worker = OllamaWorker(
+            final_prompt, img_paths, self.model_name,
+            self.provider, self.base_url
+        )
+        self.ollama_worker.progress.connect(self._on_ollama_progress)
+        self.ollama_worker.finished.connect(self._on_ollama_finished)
+        self.ollama_worker.error.connect(self._on_ollama_error)
+        self.ollama_worker.start()
+
+        # RB3.8B: Set runtime lock state
+        self._v3_runtime_state = "RUNNING_SINGLE"
+        self._update_runtime_lock_state()
+        
+        self.progress_bar.setVisible(True)
+        self._log(f"[V3] Analyzing with {self.provider} model: {self.model_name}...")
+
+
+    def _build_scene_context(self, scene: dict) -> str:
+        """Build SCENE_CONTEXT block for runtime injection.
+        
+        Includes timeline, subtitle_text[:200], and audio summary
+        matching old runtime context assembly.
+        """
+        audio_type = scene.get("audio_type", "unknown")
+        audio_energy = scene.get("audio_energy", 0.0)
+        subtitle_text = scene.get("subtitle_text", "")
+        has_subtitle = scene.get("has_subtitle", False)
+        
+        # Subtitle line matching old runtime behavior
+        if has_subtitle and subtitle_text:
+            subtitle_line = f"- subtitle: {subtitle_text[:200]}\n"
+        else:
+            subtitle_line = "- subtitle: none\n"
+        
+        return f"""SCENE CONTEXT
+- timeline: scene #{scene['id']} at {scene.get('start_time', 0):.1f}s-{scene.get('end_time', 0):.1f}s
+{subtitle_line}- audio summary: type={audio_type}, energy={audio_energy:.2f}
+"""
+
+    def _on_ollama_progress(self, msg: str):
+        self._log(msg)
+
+    def _on_ollama_finished(self, result: str):
+        """Handle analysis completion - auto-save and display results.
+        
+        RB3.8B: Single mode transitions to IDLE.
+        RB3.8E: Batch mode parses N OUTPUT_BLOCKs from single response.
+        
+        Multi-Scene Flow:
+        1. Parse N OUTPUT_BLOCK from response
+        2. Save each block to corresponding scene
+        3. Update all scene states
+        4. Advance batch
+        """
+        self._log("Analysis complete")
+        
+        # TRACE: Log callback entry state
+        worker_exists = hasattr(self, 'ollama_worker') and self.ollama_worker is not None
+        worker_running = self.ollama_worker.isRunning() if worker_exists else False
+        batch_running = self._batch_running
+        scenes_count = len(self._batch_current_scenes) if hasattr(self, '_batch_current_scenes') and self._batch_current_scenes else 0
+        self._log(f"[TRACE_FINISHED] Callback entered | _batch_running={batch_running} | worker_exists={worker_exists} | worker_isRunning={worker_running} | _batch_current_scenes count={scenes_count}")
+
+        # Raw Output tab: full raw model response
+        self.raw_output_text.setPlainText(result)
+
+        # RB3.8E: Multi-scene or single-scene handling
+        if self._batch_running and len(self._batch_current_scenes) > 1:
+            # Multi-scene batch: parse N OUTPUT_BLOCKs
+            blocks = self._split_multi_scene_output(result)
+            
+            if not blocks:
+                self._log(f"[BATCH] WARNING: No OUTPUT_BLOCKs found in multi-scene response. Saving raw for {len(self._batch_current_scenes)} scenes")
+                # Fallback: save raw output for each scene
+                for i, scene in enumerate(self._batch_current_scenes):
+                    phase1_path = save_phase1_scene_analysis(
+                        self.current_package_dir, scene, result,
+                        analysis_model=self.model_name,
+                        prompt_version="P1_MULTI"
+                    )
+                    self._log(f"[BATCH] Saved (raw fallback) scene {i+1}: {phase1_path.name}")
+                    self._scene_analysis_states[scene['id']] = "complete"
+            else:
+                # N OUTPUT_BLOCKs found - save each to corresponding scene
+                for scene_idx, block_text in blocks:
+                    scene = self._batch_current_scenes[scene_idx]
+                    phase1_path = save_phase1_scene_analysis(
+                        self.current_package_dir, scene, block_text,
+                        analysis_model=self.model_name,
+                        prompt_version="P1_MULTI"
+                    )
+                    self._log(f"[BATCH] Saved scene {scene_idx + 1}/{len(blocks)}: {phase1_path.name}")
+                    self._scene_analysis_states[scene['id']] = "complete"
+                
+                # Handle any scenes that didn't get a block
+                saved_indices = {idx for idx, _ in blocks}
+                for i, scene in enumerate(self._batch_current_scenes):
+                    if i not in saved_indices:
+                        self._log(f"[BATCH] WARNING: No OUTPUT_BLOCK for scene {i + 1}: {scene['name']}")
+                        self._scene_analysis_states[scene['id']] = "failed"
+            
+            # Show N scenes saved in Clean Output
+            self.clean_output_text.setPlainText(f"[RB3.8E] Processed {len(blocks)} OUTPUT_BLOCKs from {len(self._batch_current_scenes)} scenes\n" if blocks else "")
+            
+            # Update indicators
+            self._refresh_scene_list_indicators()
+            
+            # RB3.8E1E2: Scene-based progress + ETA
+            completed_scenes = self._batch_total_scenes - len(self._batch_queue)
+            elapsed = time.time() - self._batch_start_time
+            elapsed_str = self._format_duration(elapsed)
+            
+            # Calculate ETA based on batch performance
+            if completed_scenes > 0 and elapsed > 0:
+                rate = completed_scenes / elapsed  # scenes per second
+                remaining_scenes = len(self._batch_queue)
+                eta_seconds = remaining_scenes / rate if rate > 0 else 0
+                eta_str = self._format_duration(eta_seconds)
+            else:
+                eta_str = "calculating..."
+            
+            percent = int((completed_scenes / self._batch_total_scenes) * 100) if self._batch_total_scenes > 0 else 0
+            
+            self.progress_bar.setValue(completed_scenes)
+            self._batch_progress_label.setText(
+                f"{completed_scenes} / {self._batch_total_scenes} scenes ({percent}%) | "
+                f"Elapsed: {elapsed_str} | ETA: {eta_str}"
+            )
+            
+            if self._batch_queue:
+                # More scenes remain - start next batch
+                self._log(f"[BATCH] Multi-scene batch complete. {len(self._batch_queue)} scenes remaining")
+                self._analyze_all_next()
+            else:
+                # All scenes processed
+                self._batch_complete()
+        else:
+            # Single-scene: original flow (batch with 1 scene or single mode)
+            if self._batch_running and len(self._batch_current_scenes) == 1:
+                # Single scene in batch mode (batch_size=1 or last scene)
+                active_scene = self._batch_current_scenes[0]
+            else:
+                active_scene = self.selected_scene
+            
+            # Parse the single OUTPUT_BLOCK from response
+            clean_block = parse_raw_output(result)
+            self.clean_output_text.setPlainText(clean_block)
+            
+            if active_scene and self.current_package_dir:
+                phase1_path = save_phase1_scene_analysis(
+                    self.current_package_dir, active_scene, result,
+                    analysis_model=self.model_name,
+                    prompt_version="P1"
+                )
+                self._log(f"Saved analysis: {phase1_path}")
+                self._scene_analysis_states[active_scene['id']] = "complete"
+                
+                if self._batch_running:
+                    self._refresh_scene_list_indicators()
+            
+            # RB3.8C: Only hide progress bar in single mode
+            if not self._batch_running:
+                self.progress_bar.setVisible(False)
+            
+            # RB3.8B: State transitions
+            if self._batch_running:
+                self._analyze_all_finished()
+            else:
+                self._v3_runtime_state = "IDLE"
+                self._update_runtime_lock_state()
+
+    def _on_ollama_error(self, error: str):
+        """Handle analysis error - continue batch or return to IDLE.
+        
+        RB3.8B: Single mode transitions to IDLE.
+        Batch mode transitions handled in _batch_complete or _analyze_all_finished.
+        
+        RB3.8E: Multi-scene batch marks ALL current scenes as failed,
+        then continues to next batch or completes.
+        """
+        # TRACE: Log callback entry state
+        worker_exists = hasattr(self, 'ollama_worker') and self.ollama_worker is not None
+        worker_running = self.ollama_worker.isRunning() if worker_exists else False
+        batch_running = self._batch_running
+        scenes_count = len(self._batch_current_scenes) if hasattr(self, '_batch_current_scenes') and self._batch_current_scenes else 0
+        self._log(f"[TRACE_ERROR] Callback entered | _batch_running={batch_running} | worker_exists={worker_exists} | worker_isRunning={worker_running} | _batch_current_scenes count={scenes_count}")
+        self._log(f"Analysis error: {error}")
+        
+        # RB3.8E: Determine affected scenes
+        if self._batch_running:
+            if self._batch_current_scenes and len(self._batch_current_scenes) > 1:
+                # Multi-scene batch: all N scenes failed
+                scene_count = len(self._batch_current_scenes)
+                self._log(f"[BATCH] Multi-scene request failed: {scene_count} scenes marked failed")
+                QMessageBox.warning(self, "Batch Analysis Error", 
+                    f"Failed to analyze batch of {scene_count} scenes: {error}")
+                for scene in self._batch_current_scenes:
+                    self._scene_analysis_states[scene['id']] = "failed"
+                # Clear multi-scene state
+                self._batch_current_scenes = []
+            elif self._batch_current_scene:
+                # Single scene batch mode
+                QMessageBox.warning(self, "Analysis Error", f"Failed to analyze scene: {error}")
+                self._scene_analysis_states[self._batch_current_scene['id']] = "failed"
+                self._batch_current_scene = None
+            else:
+                # Fallback with generic warning
+                QMessageBox.warning(self, "Analysis Error", f"Analysis failed: {error}")
+            
+            self._refresh_scene_list_indicators()
+        else:
+            # Single mode
+            QMessageBox.warning(self, "Analysis Error", f"Failed to analyze scene: {error}")
+        
+        # RB3.8C: Only hide progress bar in single mode
+        if not self._batch_running:
+            self.progress_bar.setVisible(False)
+        
+        # RB3.8B: State transitions
+        if self._batch_running:
+            # Batch mode: queue continues, state remains RUNNING_BATCH
+            self._analyze_all_finished()
+        else:
+            # Single mode: return to IDLE
+            self._v3_runtime_state = "IDLE"
+            self._update_runtime_lock_state()
+
+    # RB3.8A: Analyze All Scenes V3 - Sequential batch processing
+    def _analyze_all_scenes_v3(self):
+        """Entry point for Analyze All Scenes V3.
+        
+        Creates queue from scene_list and starts first scene analysis.
+        
+        RB3.8B: Sets runtime state to RUNNING_BATCH at entry.
+        Restore to IDLE happens in _batch_complete or _cancel_v3.
+        
+        RB3.8C: Respects batch_size from spinbox. Shows progress UI.
+        """
+        if not self.scene_list:
+            QMessageBox.warning(self, "No Scenes", "No scenes to analyze.")
+            return
+        
+        # Lock: prevent re-entry during batch or single analysis
+        if self._v3_runtime_state != "IDLE":
+            self._log(f"[BATCH] BLOCKED: Runtime state is {self._v3_runtime_state}")
+            return
+        
+        # RB3.8C: Overwrite protection — detect existing analysis files
+        if self.current_package_dir:
+            analysis_dir = get_analysis_dir(self.current_package_dir)
+            existing_files = list(analysis_dir.glob(f"{SCENE_SRC_PREFIX}*.json")) if analysis_dir.exists() else []
+            if existing_files:
+                reply = QMessageBox.question(
+                    self, "Overwrite Analysis?",
+                    "Analyze All Scenes V3 will overwrite existing analysis files.\n\nContinue?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    self._log("[BATCH] Overwrite cancelled by user")
+                    return
+
+                # Delete all existing analysis files
+                for f in existing_files:
+                    try:
+                        f.unlink()
+                    except Exception as e:
+                        self._log(f"[BATCH] Failed to delete {f.name}: {e}")
+                self._log(f"[BATCH] Deleted {len(existing_files)} existing analysis file(s)")
+
+                # Clear runtime scene status cache
+                self._scene_analysis_states.clear()
+                self._refresh_scene_list_indicators()
+
+        # RB3.8E: Multi-Scene Request Engine - load ALL scenes into queue
+        batch_size = self.batch_size_spin.value()
+        self._batch_index = 0  # Track which batch window we're on
+        self._batch_total_scenes = len(self.scene_list)  # Track TOTAL for progress
+        # RB3.8E: Load ALL scenes into queue for multi-scene processing
+        self._batch_queue = list(self.scene_list)  # Copy all scenes
+        
+        self._batch_running = True
+        
+        self._log(f"[BATCH] Starting multi-scene batch: {self._batch_total_scenes} scenes (batch_size={batch_size})")
+        
+        # RB3.8B: Set runtime lock state to RUNNING_BATCH
+        self._v3_runtime_state = "RUNNING_BATCH"
+        self._update_runtime_lock_state()
+        
+        # RB3.8C: Show progress UI
+        self.progress_bar.setMaximum(self._batch_total_scenes)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self._batch_current_label.setVisible(True)
+        self._batch_progress_label.setVisible(True)
+        self._batch_progress_label.setText(f"Completed: 0 / {self._batch_total_scenes}  Remaining: {self._batch_total_scenes}")
+        
+        # RB3.8E1E2: Initialize start time for ETA
+        self._batch_start_time = time.time()
+        
+        # RB3.8E: Start multi-scene batch processing
+        self._log(f"[BATCH] Starting multi-scene request engine")
+        self._analyze_all_next()
+
+    def _analyze_all_next(self):
+        """RB3.8E: Multi-Scene Request Engine - process N scenes per request.
+        
+        Takes UP TO batch_size scenes from queue, builds N prompts,
+        sends single multi-image worker request.
+        
+        Flow:
+        1. Take N scenes from queue (or remaining scenes)
+        2. Build metadata + compile prompt for each
+        3. Merge prompts with headers
+        4. Build list of N image paths
+        5. Send single OllamaWorker request
+        6. _on_ollama_finished parses N OUTPUT_BLOCKs
+        """
+        batch_size = self.batch_size_spin.value()
+        
+        # RB3.8E: Take UP TO batch_size scenes from queue
+        self._batch_current_scenes = []
+        self._batch_current_prompts = []
+        self._batch_current_images = []
+        
+        while self._batch_queue and len(self._batch_current_scenes) < batch_size:
+            scene = self._batch_queue.pop(0)
+            frame_path = scene.get('frame') or scene.get('path')
+            
+            if not frame_path or not os.path.exists(frame_path):
+                self._log(f"[BATCH] SKIP: No frame for {scene['name']}")
+                continue
+            
+            # Build prompt for this scene
+            _saved_registry = getattr(self, 'metadata_registry', None) or {}
+            _batch_registry = self._build_batch_metadata_registry(scene)
+            self.metadata_registry = _batch_registry
+            final_prompt = self._compile_final_prompt()
+            self.metadata_registry = _saved_registry
+            
+            self._batch_current_scenes.append(scene)
+            self._batch_current_prompts.append(final_prompt)
+            self._batch_current_images.append(frame_path)
+        
+        if not self._batch_current_scenes:
+            self._log("[BATCH] ERROR: No valid scenes in batch")
+            self._batch_complete()
+            return
+        
+        # Update running label - show first scene for single-scene, N scenes for multi
+        if len(self._batch_current_scenes) == 1:
+            self._batch_current_label.setText(f"Running: {self._batch_current_scenes[0]['name']}")
+        else:
+            scene_names = ", ".join([s['name'] for s in self._batch_current_scenes])
+            self._batch_current_label.setText(f"Running: [{len(self._batch_current_scenes)} scenes] {scene_names[:50]}...")
+        
+        # Set RUNNING status for all scenes in batch
+        for scene in self._batch_current_scenes:
+            self._scene_analysis_states[scene['id']] = "running"
+        self._refresh_scene_list_indicators()
+        
+        # RB3.8E: Merge prompts with headers
+        merged_prompt = self._build_batch_prompt_multi_scene()
+        
+        # Show merged prompt in preview
+        self.final_prompt_text.setPlainText(merged_prompt)
+        
+        self._log(f"[BATCH] Compiling multi-scene batch: {len(self._batch_current_scenes)} scenes")
+        
+        # Create single worker for all images
+        self.ollama_worker = OllamaWorker(
+            merged_prompt, self._batch_current_images, self.model_name,
+            self.provider, self.base_url
+        )
+        self.ollama_worker.progress.connect(self._on_ollama_progress)
+        self.ollama_worker.finished.connect(self._on_ollama_finished)
+        self.ollama_worker.error.connect(self._on_ollama_error)
+        self.ollama_worker.start()
+        
+        self._log(f"[BATCH] Multi-scene worker started with {len(self._batch_current_images)} images")
+
+    def _analyze_all_finished(self):
+        """Called after each scene completes (from _on_ollama_finished or _on_ollama_error).
+        
+        Advances queue to next scene or completes batch.
+        
+        RB3.8C: Updates progress bar and completion/remaining counts.
+        """
+        if not self._batch_running:
+            return
+        
+        remaining = len(self._batch_queue)
+        done = self._batch_total_scenes - remaining
+        
+        # RB3.8C: Update progress display
+        self.progress_bar.setValue(done)
+        self._batch_progress_label.setText(f"Completed: {done} / {self._batch_total_scenes}  Remaining: {remaining}")
+        
+        if remaining > 0:
+            # More scenes in current batch window
+            scene = self._batch_queue.pop(0)
+            self._batch_current_scene = scene  # RB3.8A2: Batch owns scene, NOT self.selected_scene
+            self._log(f"[BATCH] Scene {done + 1}/{self._batch_total_scenes} complete. Next: {scene['name']}")
+            self._analyze_all_next()
+        else:
+            # Current batch window complete - load next batch from scene_list
+            self._batch_index += 1
+            batch_size = self.batch_size_spin.value()
+            start_idx = self._batch_index * batch_size
+            end_idx = start_idx + batch_size
+            
+            if start_idx < len(self.scene_list):
+                # More scenes remain - load next batch window
+                next_batch = self.scene_list[start_idx:end_idx]
+                self._batch_queue = next_batch
+                scene = self._batch_queue.pop(0)
+                self._batch_current_scene = scene
+                self._log(f"[BATCH] Batch {self._batch_index + 1} starting: {scene['name']}")
+                self._analyze_all_next()
+            else:
+                # All scenes processed
+                self._batch_complete()
+
+    def _batch_complete(self):
+        """Complete batch processing and re-enable UI.
+        
+        RB3.8C: Sets progress to 100% and hides progress labels.
+        """
+        self._batch_running = False
+        self._batch_queue = None
+        self._batch_current_scene = None  # RB3.8A2: Clear batch-owned scene state
+        self._log(f"[BATCH] All {self._batch_total_scenes} scenes complete")
+        self._log("=" * 40)
+        self._log("BATCH ANALYSIS COMPLETE")
+        self._log("=" * 40)
+        
+        # RB3.8C: Set progress to 100%
+        self.progress_bar.setValue(self._batch_total_scenes)
+        self._batch_current_label.setVisible(False)
+        self._batch_progress_label.setVisible(False)
+        
+        # RB3.8B: Restore buttons via centralized lock state
+        self._v3_runtime_state = "IDLE"
+        self._update_runtime_lock_state()
+        
+        # Refresh scene list to show updated states
+        self._refresh_scene_list_indicators()
+    # -------------------------------------------------------------------------
+    # PROVIDER CONFIG
+    # -------------------------------------------------------------------------
+
+    def _on_model_changed(self, model: str):
+        if model and model not in ("(no models found)", "(fetch error)"):
+            self.model_name = model
+            self._log(f"Model changed to: {model}")
+            self._save_config()
+
+    def _load_config(self):
+        """Load saved provider/model configuration.
+        
+        RB3.8C: Also loads batch_size setting.
+        """
+        config_path = Path(CONFIG_FILE)
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                self.provider = config.get("provider", DEFAULT_PROVIDER)
+                self.base_url = config.get("base_url", DEFAULT_BASE_URL)
+                self.model_name = config.get("model", DEFAULT_MODEL)
+                self.batch_size = config.get("batch_size", 2)
+            except Exception:
+                pass
+        if not hasattr(self, 'batch_size'):
+            self.batch_size = 2
+
+    def _save_config(self):
+        """Save provider/model configuration.
+        
+        RB3.8C: Also saves batch_size setting.
+        """
+        config = {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.model_name,
+            "batch_size": self.batch_size
+        }
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+
+
+
+    def _load_saved_prompts(self):
+        for name in DEFAULT_PROMPTS.keys():
+            safe = name.lower().replace(" ", "_")
+            fp = Path(PROMPTS_DIR) / f"{safe}.txt"
+            if fp.exists():
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        self.prompts[name] = f.read()
+                except Exception:
+                    pass
+
+    def _load_previous_context_memory(self, num_scenes: int = 3) -> str:
+        """Load previous scene analysis results for context injection.
+
+        Returns a compact PREVIOUS_CONTEXT block with ONLY:
+        - characters=
+        - environment=
+        - actions=
+
+        Maximum num_scenes previous scenes. Returns empty string if no data.
+        Uses package-local analysis directory: output/<video_name>/analysis/
+        """
+        if num_scenes <= 0:
+            return ""
+        if not self.current_package_dir:
+            return ""
+
+        analysis_dir = get_analysis_dir(self.current_package_dir)
+        if not analysis_dir.exists():
+            return ""
+
+        # Get all scene_src_XXXX.json files sorted by scene number
+        scene_files = sorted(analysis_dir.glob(f"{SCENE_SRC_PREFIX}*.json"))
+        scene_files = [f for f in scene_files if "scene_groups" not in f.name]
+
+        if not scene_files:
+            return ""
+
+        # Take the last N files (most recently analyzed)
+        recent_files = scene_files[-num_scenes:] if len(scene_files) >= num_scenes else scene_files
+
+        context_parts = ["PREVIOUS_CONTEXT"]
+
+        for sf in recent_files:
+            try:
+                with open(sf, "r", encoding="utf-8") as f:
+                    scene_data = json.load(f)
+
+                sem = scene_data.get("semantic", {})
+
+                line_parts = []
+                characters = sem.get("characters", [])
+                if characters:
+                    line_parts.append(f"characters={', '.join(characters)}")
+                environment = sem.get("environment", "")
+                if environment:
+                    line_parts.append(f"environment={environment}")
+                actions = sem.get("actions", [])
+                if actions:
+                    line_parts.append(f"actions={', '.join(actions)}")
+
+                if line_parts:
+                    context_parts.append(" | ".join(line_parts))
+
+            except Exception as e:
+                self._log(f"[CONTEXT] Failed to load {sf.name}: {e}")
+
+        if len(context_parts) == 1:
+            # No valid data found
+            return ""
+
+        return "\n".join(context_parts) + "\n"
+
+    # ---- RB2 STUBS: methods removed by purge, kept as minimal stubs for call compatibility ----
+
+    def _refresh_scene_list_indicators(self):
+        """Refresh scene list widget indicators based on analysis states.
+
+        RB3.8C1: Restored full indicator support.
+        - RUNNING = Blue indicator
+        - SUCCESS = Green indicator
+        - FAIL = Red indicator
+        """
+        if not hasattr(self, 'scene_list_widget') or not hasattr(self, 'scene_list'):
+            return
+        for i in range(min(self.scene_list_widget.count(), len(self.scene_list))):
+            scene = self.scene_list[i]
+            scene_id = scene.get('id', scene.get('source_scene_id', ''))
+            state = self._scene_analysis_states.get(scene_id, "unanalyzed")
+            item = self.scene_list_widget.item(i)
+            if item:
+                text = item.text()
+                # Remove all indicators first
+                clean_text = text
+                for tag in [" [RUNNING]", " [OK]", " [FAIL]"]:
+                    if tag in clean_text:
+                        clean_text = clean_text.replace(tag, "")
+                
+                if state == "running":
+                    item.setText(clean_text + " [RUNNING]")
+                    item.setForeground(QColor("#4488ff"))  # Blue
+                elif state == "complete":
+                    item.setText(clean_text + " [OK]")
+                    item.setForeground(QColor("#44cc44"))  # Green
+                elif state == "failed":
+                    item.setText(clean_text + " [FAIL]")
+                    item.setForeground(QColor("#ff4444"))  # Red
+                else:
+                    item.setText(clean_text)
+                    item.setForeground(QColor("#ffffff"))  # White (default)
+
+    def _build_batch_prompt_base(self) -> str:
+        """Stub: return empty string. Batch prompt building inlined at call sites."""
+        return ""
+    
+    def _build_batch_prompt_multi_scene(self) -> str:
+        """RB3.8E: Merge N scene prompts into single multi-scene request.
+        
+        Each prompt is wrapped with a scene header and OUTPUT_BLOCK markers.
+        The response parser will split by OUTPUT_BLOCK markers.
+        """
+        delimiter = "\n" + "=" * 60 + "\n"
+        merged = ""
+        
+        for i, prompt in enumerate(self._batch_current_prompts):
+            scene = self._batch_current_scenes[i]
+            scene_num = i + 1
+            header = (
+                f"{delimiter}"
+                f"## SCENE {scene_num}: {scene['name']}\n"
+                f"## Image: {os.path.basename(self._batch_current_images[i])}\n"
+                f"{delimiter}\n"
+            )
+            merged += header + prompt + "\n"
+        
+        # Add final section
+        merged += delimiter
+        merged += "Process each scene above and respond with OUTPUT_BLOCK for each.\n"
+        merged += delimiter
+        
+        return merged
+    
+    def _split_multi_scene_output(self, raw_output: str) -> List[Tuple[int, str]]:
+        """RB3.8E: Split multi-scene response into individual OUTPUT_BLOCKs.
+        
+        Returns list of (scene_index, output_block_text) tuples.
+        Scene_index is 0-based, matching _batch_current_scenes.
+        
+        FIX RB3.8E1E2: Match actual model output format:
+        <<OUTPUT_BLOCK>>
+        content
+        <</OUTPUT_BLOCK>>
+        """
+        blocks = []
+        
+        # RB3.8E1E2 FIX: Use correct delimiter format
+        import re
+        pattern = r'<<OUTPUT_BLOCK>>\s*\n(.*?)\s*<</OUTPUT_BLOCK>>'
+        matches = re.findall(pattern, raw_output, re.DOTALL)
+        
+        if not matches:
+            # Fallback: try single output block
+            self._log("[BATCH] WARNING: Could not split multi-scene output, treating as single block")
+            if raw_output.strip():
+                blocks.append((0, raw_output))
+        else:
+            self._log(f"[BATCH] Parsed {len(matches)} OUTPUT_BLOCKs")
+            for i, match in enumerate(matches):
+                if i < len(self._batch_current_scenes):
+                    blocks.append((i, match.strip()))
+                else:
+                    self._log(f"[BATCH] WARNING: Extra OUTPUT_BLOCK at index {i}, ignoring")
+        
+        return blocks
+
+    def _format_duration(self, seconds: float) -> str:
+        """RB3.8E1E2: Format seconds to HH:MM:SS or MM:SS string."""
+        if seconds < 0:
+            return "00:00"
+        seconds = int(seconds)
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.logs_text.append(f"[{ts}] {msg}")
+        self.logs_text.moveCursor(QTextCursor.End)
+
+    # -------------------------------------------------------------------------
+    # UI LAYOUT PERSISTENCE (RB3.3.4)
+    # -------------------------------------------------------------------------
+
+    def _save_ui_layout(self) -> None:
+        """Save current UI layout to config/ui_layout.json.
+        
+        Saves:
+        - window_width/height
+        - main_splitter sizes
+        - bottom_splitter sizes
+        """
+        try:
+            ensure_dir("config")
+            layout_data = {
+                "window_width": self.width(),
+                "window_height": self.height(),
+                "main_splitter": list(self.main_splitter.sizes()) if hasattr(self, "main_splitter") and self.main_splitter else [],
+                "bottom_splitter": list(self.bottom_splitter.sizes()) if hasattr(self, "bottom_splitter") and self.bottom_splitter else []
+            }
+            with open(UI_LAYOUT_FILE, "w", encoding="utf-8") as f:
+                json.dump(layout_data, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save UI layout: {e}")
+
+    def _restore_ui_layout(self) -> None:
+        """Restore UI layout from config/ui_layout.json.
+        
+        Restores:
+        - window size
+        - main_splitter sizes
+        - bottom_splitter sizes
+        
+        Silently ignores missing file or invalid data.
+        """
+        try:
+            layout_path = Path(UI_LAYOUT_FILE)
+            if not layout_path.exists():
+                return
+            
+            with open(layout_path, "r", encoding="utf-8") as f:
+                layout_data = json.load(f)
+            
+            if not isinstance(layout_data, dict):
+                return
+            
+            # Restore window size
+            width = layout_data.get("window_width", 1400)
+            height = layout_data.get("window_height", 900)
+            self.resize(width, height)
+            
+            # Restore main splitter sizes
+            if hasattr(self, "main_splitter") and self.main_splitter:
+                main_sizes = layout_data.get("main_splitter", [])
+                if isinstance(main_sizes, list) and len(main_sizes) >= 3:
+                    self.main_splitter.setSizes(main_sizes)
+            
+            # Restore bottom splitter sizes
+            if hasattr(self, "bottom_splitter") and self.bottom_splitter:
+                bottom_sizes = layout_data.get("bottom_splitter", [])
+                if isinstance(bottom_sizes, list) and len(bottom_sizes) >= 2:
+                    self.bottom_splitter.setSizes(bottom_sizes)
+                    
+        except Exception as e:
+            print(f"Failed to restore UI layout: {e}")
+
+    def closeEvent(self, event):
+        """Clean up threads and save UI layout on window close."""
+        self._save_ui_layout()
+        try:
+            if hasattr(self, "batch_worker") and self.batch_worker:
+                self.batch_worker.quit()
+                self.batch_worker.wait()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "ollama_worker") and self.ollama_worker:
+                self.ollama_worker.quit()
+                self.ollama_worker.wait()
+        except Exception:
+            pass
+        event.accept()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QMainWindow { background-color: #1a1a1a; }
+        QWidget { background-color: #1a1a1a; color: #e0e0e0; }
+        QGroupBox {
+            border: 1px solid #444; border-radius: 4px;
+            margin-top: 8px; font-weight: bold;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin; subcontrol-position: top left;
+            padding: 0 4px; color: #aaa;
+        }
+        QPushButton {
+            background-color: #2a2a2a; border: 1px solid #444;
+            padding: 6px 12px; border-radius: 4px;
+        }
+        QPushButton:hover { background-color: #3a3a3a; border-color: #0f0; }
+        QPushButton:pressed { background-color: #1a1a1a; }
+        QPushButton:disabled { background-color: #222; color: #666; }
+        QListWidget {
+            background-color: #222; border: 1px solid #444; outline: none;
+        }
+        QListWidget::item:selected { background-color: #0f0; color: #000; }
+        QListWidget::item:hover { background-color: #333; }
+        QTextEdit { background-color: #1e1e1e; border: 1px solid #333; color: #d4d4d4; }
+        QTabWidget::pane { border: 1px solid #444; background-color: #1e1e1e; }
+        QTabBar::tab {
+            background-color: #2a2a2a; padding: 6px 12px; border: 1px solid #444;
+        }
+        QTabBar::tab:selected { background-color: #0f0; color: #000; }
+        QComboBox {
+            background-color: #2a2a2a; border: 1px solid #444;
+            padding: 4px 8px; border-radius: 3px;
+        }
+        QComboBox::drop-down { border: none; }
+        QProgressBar {
+            border: 1px solid #444; border-radius: 4px;
+            background-color: #222; text-align: center;
+        }
+        QProgressBar::chunk { background-color: #0f0; }
+        QLabel { color: #e0e0e0; }
+        QScrollBar:vertical { background-color: #222; width: 12px; }
+        QScrollBar::handle:vertical {
+            background-color: #444; border-radius: 6px;
+        }
+        QScrollBar::handle:vertical:hover { background-color: #555; }
+        QScrollBar:horizontal { background-color: #222; height: 12px; }
+        QScrollBar::handle:horizontal {
+            background-color: #444; border-radius: 6px;
+        }
+    """)
+
+    window = PackageLoader()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,45 @@
+Known characters:
+
+- Minato = nam thanh niên tóc nâu, thường đi cùng Sơn Thần
+- Sơn Thần = sói trắng khổng lồ, lông mày vàng
+- Phong Thần = thần nhỏ màu xanh lá, mặc đồ xanh
+- Lôi Thần = thần nhỏ màu đỏ, có vòng tròn quanh người
+- Rồng Thần = rồng nhỏ màu xanh bay lơ lửng
+- Saiga = nhân vật tóc đen, đeo kính, hay mặc vét
+- Kỳ Lân = kỳ lân nhỏ màu vàng đất, xanh lá
+- Rùa Thần = rùa vàng, mai có núi nhỏ và cây
+- Usuji = chồn nhỏ màu xanh lá
+- Torika = chồn nhỏ màu vàng
+- Seri = chồn nhỏ màu đỏ
+- Thiên Hồ = cáo chín đuôi
+- Phượng Hoàng = chim phượng hoàng nhỏ rực lửa
+
+Task:
+
+Mô tả cảnh hiện tại.
+
+Nếu nhân vật giống dữ liệu trên thì dùng đúng tên.
+
+Rules:
+- ngắn
+- không viết văn
+- không giải thích
+- không suy luận
+- chỉ mô tả thứ nhìn thấy
+- thấy một phần => partial
+- không chắc => unknown
+- close mặt => shot_type=closeup
+- cảnh rộng => shot_type=wide
+- chỉ return format
+
+Return ONLY:
+
+scene_summary=
+shot_type=
+characters=
+creatures=
+actions=
+environment=
+objects=
+visibility=
+confidence=

@@ -1,0 +1,30 @@
+{
+  "modules": {
+    "Luật": {
+      "filename": "Luật.txt",
+      "enabled": true,
+      "priority": 130
+    },
+    "Nhân_vật": {
+      "filename": "Nhân_vật.txt",
+      "enabled": true,
+      "priority": 150
+    },
+    "Nhiệm_vụ": {
+      "filename": "Nhiệm_vụ.txt",
+      "enabled": true,
+      "priority": 160
+    },
+    "Return_ONLY": {
+      "filename": "Return_ONLY.txt",
+      "enabled": true,
+      "priority": 170
+    },
+    "CONTEXTMEMORYPROMPT": {
+      "filename": "CONTEXTMEMORYPROMPT.txt",
+      "enabled": true,
+      "priority": 180
+    }
+  },
+  "version": 1
+}

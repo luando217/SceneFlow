@@ -1,0 +1,14 @@
+# Luật
+# Add your prompt content here
+* ngắn
+* không viết văn
+* không giải thích
+* không suy luận
+* không lore
+* không đoán
+* partial nếu thấy một phần
+* unknown nếu không chắc
+* close mặt = closeup
+* cảnh rộng = wide
+* Đầu ra tiếng việt
+* Mô tả đúng nhân vật, hoạt động, cảnh có trong ảnh, không tự sáng tác thêm

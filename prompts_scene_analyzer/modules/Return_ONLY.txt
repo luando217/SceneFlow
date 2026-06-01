@@ -1,0 +1,28 @@
+# Return ONLY:
+# Add your prompt content here
+<<OUTPUT_BLOCK>>
+Namefile=
+Promtinject=
+Scene ID:
+Frame:
+Analysis File:
+Duration:
+Scene Start:
+Scene End:
+Audio Type:
+Audio Energy:
+---------------------
+Subtitle=
+scene_summary=
+shot_type=
+characters_count=
+characters=
+characters_action=
+creatures_count=
+creatures=
+actions=
+environment=
+objects=
+visibility=
+confidence=
+<</OUTPUT_BLOCK>>

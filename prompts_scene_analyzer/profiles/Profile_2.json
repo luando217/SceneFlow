@@ -1,0 +1,21 @@
+{
+  "modules": {
+    "Luật": {
+      "enabled": false,
+      "priority": 130
+    },
+    "Nhân_vật": {
+      "enabled": false,
+      "priority": 150
+    },
+    "Nhiệm_vụ": {
+      "enabled": false,
+      "priority": 160
+    },
+    "Return_ONLY": {
+      "enabled": true,
+      "priority": 170
+    }
+  },
+  "version": 1
+}

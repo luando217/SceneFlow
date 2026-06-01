@@ -1,0 +1,12 @@
+# Nhiệmvụ
+# Add your prompt content here
+Mỗi ảnh là 1 scene riêng.
+
+Chỉ mô tả đúng ảnh hiện tại.
+
+Không dùng:
+
+* same
+* similar
+* continue
+* unchanged

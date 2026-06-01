@@ -1,0 +1,15 @@
+﻿.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+cache/
+temp/
+logs/
+output/
+*.mp4
+*.wav
+*.png
+*.jpg
+.vscode/settings.json

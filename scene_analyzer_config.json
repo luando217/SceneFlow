@@ -1,0 +1,6 @@
+{
+  "provider": "ollama",
+  "base_url": "http://localhost:11434",
+  "model": "Gemma4:e4b-it-q4_K_M",
+  "batch_size": 5
+}

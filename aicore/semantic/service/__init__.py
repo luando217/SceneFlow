@@ -1,0 +1,1 @@
+"""Semantic service layer — validation, serialization, and export utilities."""
